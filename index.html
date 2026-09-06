@@ -58,6 +58,8 @@
   th, td{ text-align:left; padding:9px 12px; border-bottom:1px solid var(--line); font-size:13px; }
   th{ font-weight:500; color:var(--muted); font-size:12px; }
   tr:last-child td{ border-bottom:none; }
+  .spinner{ display:inline-block; width:13px; height:13px; border:2px solid var(--line); border-top-color:var(--pine); border-radius:50%; animation:spin 0.7s linear infinite; vertical-align:-2px; margin-right:6px; }
+  @keyframes spin{ to{ transform:rotate(360deg); } }
   .badge{ display:inline-block; font-size:11px; padding:2px 8px; border-radius:20px; font-weight:500; white-space:nowrap; }
   .badge-ok{ background:var(--pine-soft); color:var(--pine); }
   .badge-fixed{ background:var(--brass-soft); color:var(--brass); }
@@ -234,6 +236,11 @@
           <button class="btn secondary" id="downloadReviewBtn">Download row-level CSV</button>
           <button class="btn secondary" id="toStep2Btn">Continue to step 2 &rarr;</button>
         </div>
+        <div class="btn-row" style="margin-top:8px;">
+          <button class="btn secondary" id="tryAiBtn" style="display:none;">Try AI resolution</button>
+          <span id="tryAiStatus" style="font-size:12.5px; color:var(--muted);"></span>
+        </div>
+        <ul id="tryAiDetail" style="margin:8px 0 0 0; padding:0; list-style:none;"></ul>
       </div>
       </div>
 
@@ -355,6 +362,11 @@
           <button class="btn secondary" id="downloadReviewBtn2">Download row-level CSV</button>
           <button class="btn secondary" id="generateBtn">Generate dashboard from this data &rarr;</button>
         </div>
+        <div class="btn-row" style="margin-top:8px;">
+          <button class="btn secondary" id="tryAiBtn2" style="display:none;">Try AI resolution</button>
+          <span id="tryAiStatus2" style="font-size:12.5px; color:var(--muted);"></span>
+        </div>
+        <ul id="tryAiDetail2" style="margin:8px 0 0 0; padding:0; list-style:none;"></ul>
       </div>
     </section>
 
@@ -447,6 +459,7 @@ const ISSUE_CATALOG = {
   branch_pattern_drift: {sev:'medium', text:'Branch naming pattern differs from other years', detail:'The branch/course label used a different formatting convention (prefix style, hyphen spacing, "&" vs "and", or a more verbose specialization label) than other years and was standardized to the common name.'},
   branch_code_expanded: {sev:'medium', text:'Branch recorded as an abbreviated code', detail:'The branch was recorded as a short department code (e.g. "Comp", "ECE", "Instru") rather than its full name, and was expanded.'},
   branch_unnormalized_degree: {sev:'medium', text:'Program has no canonical specialization list yet', detail:'This degree (e.g. MBA, M.Tech) carries a specialization/branch, but there is no dictionary of canonical names for it the way B.Tech has. The value was generically cleaned (whitespace/case) but not standardized against a known list.'},
+  llm_resolved_branch: {sev:'medium', text:'Branch/degree resolved with AI assistance', detail:'This row’s branch/degree value did not match any known dictionary or pattern, so it was sent to an LLM for classification (only when the user explicitly clicked "Try AI resolution"). The model’s answer was accepted because its confidence met the threshold — see the LLM_Resolved sheet for the exact confidence score and every value that was attempted, including ones below the threshold that were left for manual review.'},
   // MINOR — cosmetic
   whitespace_trimmed:   {sev:'minor',  text:'Leading, trailing, or repeated whitespace', detail:'Extra spaces around or inside a value were trimmed.'},
   nbsp_fixed:           {sev:'minor',  text:'Non-breaking space or invisible character', detail:'A non-breaking space (invisible in Excel) was found inside a value and replaced with a normal space.'},
@@ -651,7 +664,7 @@ function parsePackageToRupees(raw){
 
   return { ok:true, rupees: Math.round(rupees), unit };
 }
-function processRow2(rec, idx){
+function processRow2(rec, idx, forcedDegreeBranch){
   const major=[], medium=[], minor=[];
   let excluded=false, excludeReason=null, removalBucket=null;
 
@@ -676,11 +689,20 @@ function processRow2(rec, idx){
   const degClean = cleanWs(rec.degree);
   let degree = null, branch = null;
   if (!excluded){
-    const resolved = detectDegreeAndBranch(degClean.value, brClean.value, major, medium);
-    if (resolved.error==='missing'){ major.push('missing_field'); excluded=true; excludeReason='Course/branch missing'; removalBucket='review'; }
-    else if (resolved.error==='unrecognized_degree'){ major.push('unrecognized_degree'); excluded=true; excludeReason=`Unrecognized degree value: "${degClean.value}"`; removalBucket='review'; }
-    else if (resolved.error==='unrecognized_branch'){ major.push('unrecognized_branch'); excluded=true; excludeReason=`Unrecognized branch/course value: "${brClean.value}"`; removalBucket='review'; }
-    else { degree = resolved.degree; branch = resolved.branch; }
+    if (forcedDegreeBranch){
+      // Used only when re-processing a row after LLM-assisted resolution (see
+      // runLlmBranchResolution) — skips detectDegreeAndBranch (which would just fail
+      // again the same way) and uses the already-resolved values directly, while still
+      // running the company/package logic below exactly as any other row would.
+      degree = forcedDegreeBranch.degree;
+      branch = forcedDegreeBranch.branch;
+    } else {
+      const resolved = detectDegreeAndBranch(degClean.value, brClean.value, major, medium);
+      if (resolved.error==='missing'){ major.push('missing_field'); excluded=true; excludeReason='Course/branch missing'; removalBucket='review'; }
+      else if (resolved.error==='unrecognized_degree'){ major.push('unrecognized_degree'); excluded=true; excludeReason=`Unrecognized degree value: "${degClean.value}"`; removalBucket='review'; }
+      else if (resolved.error==='unrecognized_branch'){ major.push('unrecognized_branch'); excluded=true; excludeReason=`Unrecognized branch/course value: "${brClean.value}"`; removalBucket='review'; }
+      else { degree = resolved.degree; branch = resolved.branch; }
+    }
   }
 
   // ---- company ----
@@ -852,14 +874,14 @@ document.querySelectorAll('#stepNav li').forEach(li=>{
 let step1Done=false, step2Done=false;
 let rawHeaders=[], rawRows=[], rawSheetNames=null, rawSheetHeaders=null;
 let allRows1=[], rawSheetNamesFull1=[], rawSheetHeadersFull1=[]; // unfiltered, for the sheet-picker to re-slice
-let processedRows=[], companyAudit=[], packageConflicts=[], duplicateExamples=[];
+let processedRows=[], companyAudit=[], packageConflicts=[], duplicateExamples=[], llmResolutionsLog=[];
 
 /* Decide how to handle a multi-sheet upload: if every sheet name looks like a year, treat it as
    one-tab-per-year (existing behaviour). Otherwise the sheets are probably different SECTIONS of
    one file (e.g. a "Clean_Data" tab plus "Summary_By_..." tabs) — auto-pick the sheet whose
    headers best match Branch/Company/Package and show a picker so the user can choose a different
    one, rather than wrongly merging every sheet's rows (including summary/audit tabs) together. */
-function resolveSheetMode(allRows, sheetNames, sheetHeaders, ids){
+function resolveSheetMode(allRows, sheetNames, sheetHeaders, headers, ids){
   const multi = sheetNames && sheetNames.length>1;
   const yearlike = multi && sheetNames.every(looksLikeYear);
   document.getElementById(ids.yearFromSheetRow).style.display = (multi && yearlike) ? 'flex' : 'none';
@@ -878,7 +900,13 @@ function resolveSheetMode(allRows, sheetNames, sheetHeaders, ids){
     return { headers: sheetHeaders[bestIdx]||[], rows: allRows.filter(r=>r.__sheet===sheetNames[bestIdx]) };
   }
   document.getElementById(ids.sheetPickRow).style.display = 'none';
-  return { headers: (sheetHeaders&&sheetHeaders[0])||[], rows: allRows };
+  // Single-sheet case: sheetHeaders is null for a CSV upload (readFile's CSV branch has no
+  // concept of sheets), so this MUST fall back to the real `headers` array readFile already
+  // parsed — falling back to [] here (as this used to) silently empties every column-mapping
+  // dropdown, which in turn makes every row's branch/company/package/year read as undefined
+  // and every row get flagged "completely empty" (a real, pre-existing bug found by testing
+  // an actual CSV upload in the browser, not just calling the pipeline functions directly).
+  return { headers: (sheetHeaders&&sheetHeaders[0]) || headers || [], rows: allRows };
 }
 const STEP1_SHEET_IDS = {yearFromSheetRow:'yearFromSheetRow', yearFromSheet:'yearFromSheet', yearFromSheetCount:'yearFromSheetCount', sheetPickRow:'sheetPickRow', mapSheet:'mapSheet'};
 const STEP2_SHEET_IDS = {yearFromSheetRow:'yearFromSheetRow2', yearFromSheet:'yearFromSheet2', yearFromSheetCount:'yearFromSheetCount2', sheetPickRow:'sheetPickRow2', mapSheet:'mapSheet2'};
@@ -899,7 +927,7 @@ function handleFile1(file){
     rawSheetNamesFull1 = sheetNames || []; rawSheetHeadersFull1 = sheetHeaders || [];
     rawSheetNames = (sheetNames && sheetNames.every(looksLikeYear)) ? sheetNames : null; // only meaningful in year-per-tab mode
     rawSheetHeaders = rawSheetNames ? sheetHeaders : null;
-    const resolved = resolveSheetMode(rows, sheetNames, sheetHeaders, STEP1_SHEET_IDS);
+    const resolved = resolveSheetMode(rows, sheetNames, sheetHeaders, headers, STEP1_SHEET_IDS);
     rawHeaders = resolved.headers; rawRows = resolved.rows;
     populateMapSelects();
     updateYearFieldVisibility();
@@ -986,6 +1014,79 @@ function runCleaningPipeline(headers, rows, sheetNames, sheetHeaders, mapping){
   return { rows: processed, audit, conflicts, headerIssueCount };
 }
 
+/* ---------------- Phase 3, slice 1: LLM-assisted branch/degree resolution ---------------- */
+const LLM_BRANCH_CONFIDENCE_THRESHOLD = 0.7;
+
+/* Re-runs the parts of the pipeline that operate on the full row set from scratch
+   (company clustering, duplicate detection, package conflicts) after LLM resolution
+   changes which rows are included — a newly-resolved row can now exactly match an
+   already-included row on year+degree+branch+company+package, or introduce a new
+   company-name variant into a cluster. clusterCompanies/flagPackageConflicts recompute
+   from scratch each call but PUSH tags onto rows rather than replacing them, so calling
+   them a second time without clearing the tags they own would double-flag rows that
+   were already tagged on the first pass — clear those two tags first, exactly as many
+   times as this function runs, so re-running is always safe. removeDuplicates needs no
+   clearing: it already skips r.excluded rows, and once a row is excluded as a
+   duplicate it stays excluded, so it can never be re-flagged on a later call. */
+function reprocessAfterLlmResolution(rows){
+  rows.forEach(r=>{
+    r.major = r.major.filter(t=>t!=='package_conflict');
+    r.medium = r.medium.filter(t=>t!=='company_variant_merged');
+  });
+  const audit = clusterCompanies(rows);
+  removeDuplicates(rows);
+  const conflicts = flagPackageConflicts(rows);
+  return { audit, conflicts };
+}
+
+/* Applies LLM resolutions to the matching rows in place (by rowNum-1 array index, so
+   processedRows/processedRows2 — which are the same array reference passed in — stay
+   in sync automatically). Returns a log entry per resolution (applied or not) for the
+   LLM_Resolved export sheet, so a below-threshold attempt is still visible, not hidden. */
+function applyLlmBranchResolutions(rows, resolutions, threshold){
+  const log = [];
+  resolutions.forEach(res=>{
+    const applied = !!(res.confidence>=threshold && res.degree && res.branch);
+    log.push({ input: res.input, degree: res.degree, branch: res.branch, confidence: res.confidence, applied });
+    if (!applied) return;
+    rows.forEach((r, i)=>{
+      if (!r.excluded || r.rawBranch!==res.input) return;
+      if (!r.major.includes('unrecognized_branch') && !r.major.includes('unrecognized_degree')) return;
+      const rec = { year:r.rawYear, degree:r.rawDegree, branch:r.rawBranch, company:r.rawCompany, package:r.rawPackage };
+      const reprocessed = processRow2(rec, i, { degree:res.degree, branch:res.branch });
+      reprocessed.medium.push('llm_resolved_branch');
+      rows[i] = reprocessed;
+    });
+  });
+  return log;
+}
+
+async function runLlmBranchResolution(rows, aiEligible, headerIssueCount, ids, llmLog, onContinue){
+  const btn = document.getElementById(ids.tryAiBtn), status = document.getElementById(ids.tryAiStatus);
+  const values = [...new Set(aiEligible.map(r=>r.rawBranch))];
+  btn.disabled = true;
+  status.innerHTML = `<span class="spinner"></span>Resolving ${values.length} unique value${values.length===1?'':'s'} with AI…`;
+  try{
+    const resp = await fetch('/api/llm-resolve', {
+      method:'POST', headers:{'Content-Type':'application/json'},
+      body: JSON.stringify({ kind:'branch', payload:{ values } })
+    });
+    const data = await resp.json().catch(()=>({}));
+    if (resp.status===501){ status.textContent = data.error || 'AI resolution isn’t configured yet.'; btn.disabled=false; return; }
+    if (!resp.ok){ status.textContent = 'AI resolution failed: ' + (data.error||`HTTP ${resp.status}`); btn.disabled=false; return; }
+
+    const newLogEntries = applyLlmBranchResolutions(rows, data.resolutions||[], LLM_BRANCH_CONFIDENCE_THRESHOLD);
+    llmLog.push(...newLogEntries);
+    const { audit, conflicts } = reprocessAfterLlmResolution(rows);
+    const appliedCount = newLogEntries.filter(l=>l.applied).length;
+    renderStepResults(rows, headerIssueCount, ids, audit, conflicts, onContinue, llmLog);
+    document.getElementById(ids.tryAiStatus).textContent = `Resolved ${appliedCount} of ${newLogEntries.length} via AI — see the LLM_Resolved sheet in the downloaded workbook for details.`;
+  } catch(e){
+    status.textContent = 'AI resolution failed: ' + e.message;
+    btn.disabled = false;
+  }
+}
+
 document.getElementById('analyzeBtn').addEventListener('click', ()=>{
   const noYearCol = document.getElementById('noYearCol').checked;
   const fromSheet = document.getElementById('yearFromSheet').checked;
@@ -1002,16 +1103,20 @@ document.getElementById('analyzeBtn').addEventListener('click', ()=>{
   companyAudit = result.audit;
   packageConflicts = result.conflicts;
   processedRows = result.rows;
-  renderStepResults(result.rows, result.headerIssueCount, STEP1_IDS, companyAudit, packageConflicts, ()=> setStepActive(2));
+  llmResolutionsLog = [];
+  renderStepResults(result.rows, result.headerIssueCount, STEP1_IDS, companyAudit, packageConflicts, ()=> setStepActive(2), llmResolutionsLog);
   step1Done=true;
 });
 
 const STEP1_IDS = {statRow:'statRow1', insight:'insight1', resultsCard:'resultsCard', issuesCard:'issuesCard', issuesReport:'issuesReport',
-  previewCard:'previewCard', previewBody:'previewBody', downloadReviewBtn:'downloadReviewBtn', downloadWorkbookBtn:'downloadWorkbookBtn', continueBtn:'toStep2Btn'};
+  previewCard:'previewCard', previewBody:'previewBody', downloadReviewBtn:'downloadReviewBtn', downloadWorkbookBtn:'downloadWorkbookBtn', continueBtn:'toStep2Btn',
+  tryAiBtn:'tryAiBtn', tryAiStatus:'tryAiStatus', tryAiDetail:'tryAiDetail'};
 const STEP2_IDS = {statRow:'statRow2', insight:'insight2', resultsCard:'resultsCard2', issuesCard:'issuesCard2', issuesReport:'issuesReport2',
-  previewCard:'previewCard2', previewBody:'previewBody2', downloadReviewBtn:'downloadReviewBtn2', downloadWorkbookBtn:'downloadWorkbookBtn2', continueBtn:'generateBtn'};
+  previewCard:'previewCard2', previewBody:'previewBody2', downloadReviewBtn:'downloadReviewBtn2', downloadWorkbookBtn:'downloadWorkbookBtn2', continueBtn:'generateBtn',
+  tryAiBtn:'tryAiBtn2', tryAiStatus:'tryAiStatus2', tryAiDetail:'tryAiDetail2'};
 
-function renderStepResults(rows, headerIssueCount, ids, audit, conflicts, onContinue){
+function renderStepResults(rows, headerIssueCount, ids, audit, conflicts, onContinue, llmLog){
+  llmLog = llmLog || [];
   const needsReview = rows.filter(r=>r.excluded && r.removalBucket==='review');
   const autoRemoved = rows.filter(r=>r.excluded && r.removalBucket==='auto');
   const included = rows.filter(r=>!r.excluded);
@@ -1053,8 +1158,38 @@ function renderStepResults(rows, headerIssueCount, ids, audit, conflicts, onCont
     const blob = new Blob([csv], {type:'text/csv'});
     const a = document.createElement('a'); a.href=URL.createObjectURL(blob); a.download='review_file.csv'; a.click();
   };
-  document.getElementById(ids.downloadWorkbookBtn).onclick = ()=> buildAndDownloadWorkbook(included, needsReview, autoRemoved, audit, conflicts);
+  document.getElementById(ids.downloadWorkbookBtn).onclick = ()=> buildAndDownloadWorkbook(included, needsReview, autoRemoved, audit, conflicts, llmLog);
   document.getElementById(ids.continueBtn).onclick = onContinue;
+
+  const aiEligible = needsReview.filter(r=>r.major.includes('unrecognized_branch')||r.major.includes('unrecognized_degree'));
+  const tryAiBtn = document.getElementById(ids.tryAiBtn);
+  if (aiEligible.length){
+    tryAiBtn.style.display = 'inline-block';
+    tryAiBtn.disabled = false;
+    tryAiBtn.textContent = `Try AI resolution (${aiEligible.length} row${aiEligible.length===1?'':'s'})`;
+    tryAiBtn.onclick = ()=> runLlmBranchResolution(rows, aiEligible, headerIssueCount, ids, llmLog, onContinue);
+  } else {
+    tryAiBtn.style.display = 'none';
+    document.getElementById(ids.tryAiStatus).textContent = '';
+  }
+  renderLlmDetail(ids, llmLog);
+}
+
+/* Renders exactly what happened for every value the AI was asked to resolve — never
+   just a bare "N of M" count. Shown inline, always visible (not hidden behind a hover
+   tooltip), consistent with how every other decision in this tool (badgeFor/rowNotes)
+   explains itself directly in the UI rather than requiring the user to guess or hover. */
+function renderLlmDetail(ids, llmLog){
+  const el = document.getElementById(ids.tryAiDetail);
+  if (!llmLog || !llmLog.length){ el.innerHTML = ''; return; }
+  el.innerHTML = llmLog.map(l=>{
+    const resolvedText = (l.degree && l.branch) ? `${l.degree}${l.degree!==l.branch?' — '+l.branch:''}` : 'not recognized by the model';
+    const pct = Math.round((l.confidence||0)*100);
+    const badge = l.applied
+      ? `<span class="badge badge-ok">Applied</span>`
+      : `<span class="badge badge-manual">Not applied — still needs manual review</span>`;
+    return `<li class="note" style="margin-bottom:4px;"><b>"${String(l.input).replace(/</g,'&lt;')}"</b> → ${resolvedText} (${pct}% confidence) ${badge}</li>`;
+  }).join('');
 }
 
 function renderIssuesReport(rows, headerIssueCount, conflicts, containerId){
@@ -1098,7 +1233,7 @@ function renderIssuesReport(rows, headerIssueCount, conflicts, containerId){
 }
 
 /* ---------------- clean workbook export (.xlsx) ---------------- */
-function buildAndDownloadWorkbook(included, needsReview, autoRemoved, audit, conflicts){
+function buildAndDownloadWorkbook(included, needsReview, autoRemoved, audit, conflicts, llmLog){
   const wb = XLSX.utils.book_new();
   const years = [...new Set(included.map(r=>r.year))].sort();
   // distinct (degree, branch) pairs — this is the real grouping key now, not branch alone,
@@ -1179,6 +1314,16 @@ function buildAndDownloadWorkbook(included, needsReview, autoRemoved, audit, con
   const uniqAudit = [...new Map(audit.map(a=>[a.from+'>>'+a.to,a])).values()].sort((a,b)=>a.from.localeCompare(b.from));
   const caAoa = [['Company as it appeared in the raw file','Standardized to']].concat(uniqAudit.map(a=>[a.from,a.to]));
   XLSX.utils.book_append_sheet(wb, XLSX.utils.aoa_to_sheet(caAoa), 'Company_Name_Changes');
+
+  // LLM_Resolved — every AI resolution attempted via the "Try AI resolution" button,
+  // including below-threshold ones that were still left for manual review, so nothing
+  // the model did is hidden from the audit trail.
+  if (llmLog && llmLog.length){
+    const llmAoa = [['Raw value','Resolved Degree','Resolved Branch','Confidence','Applied?']].concat(
+      llmLog.map(l=>[l.input, l.degree??'', l.branch??'', l.confidence, l.applied?'Yes':'No (below confidence threshold)'])
+    );
+    XLSX.utils.book_append_sheet(wb, XLSX.utils.aoa_to_sheet(llmAoa), 'LLM_Resolved');
+  }
 
   XLSX.writeFile(wb, 'Placement_Data_Clean.xlsx');
 }
@@ -1420,7 +1565,7 @@ file2.addEventListener('change', ()=>{ if (file2.files[0]) handleFile2(file2.fil
 
 let rawHeaders2=[], rawRows2=[], rawSheetNames2=null, rawSheetHeaders2=null;
 let allRows2=[], rawSheetNamesFull2=[], rawSheetHeadersFull2=[];
-let companyAudit2=[], packageConflicts2=[], processedRows2=[];
+let companyAudit2=[], packageConflicts2=[], processedRows2=[], llmResolutionsLog2=[];
 function handleFile2(file){
   document.getElementById('file2chip').innerHTML = `<div class="file-chip">${file.name}</div>`;
   readFile(file, (headers, rows, sheetNames, sheetHeaders)=>{
@@ -1428,7 +1573,7 @@ function handleFile2(file){
     rawSheetNamesFull2 = sheetNames || []; rawSheetHeadersFull2 = sheetHeaders || [];
     rawSheetNames2 = (sheetNames && sheetNames.every(looksLikeYear)) ? sheetNames : null;
     rawSheetHeaders2 = rawSheetNames2 ? sheetHeaders : null;
-    const resolved = resolveSheetMode(rows, sheetNames, sheetHeaders, STEP2_SHEET_IDS);
+    const resolved = resolveSheetMode(rows, sheetNames, sheetHeaders, headers, STEP2_SHEET_IDS);
     rawHeaders2 = resolved.headers; rawRows2 = resolved.rows;
     populateMapSelects2();
     updateYearFieldVisibility2();
@@ -1486,11 +1631,12 @@ document.getElementById('analyzeBtn2').addEventListener('click', ()=>{
   companyAudit2 = result.audit;
   packageConflicts2 = result.conflicts;
   processedRows2 = result.rows;
+  llmResolutionsLog2 = [];
   renderStepResults(result.rows, result.headerIssueCount, STEP2_IDS, companyAudit2, packageConflicts2, ()=>{
     step2Done=true;
     buildDashboard(processedRows2.filter(r=>!r.excluded));
     setStepActive(3);
-  });
+  }, llmResolutionsLog2);
 });
 
 /* ---------------- STEP 3: aggregation + dashboard (adapted from sample) ---------------- */

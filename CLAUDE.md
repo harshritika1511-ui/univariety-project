@@ -266,15 +266,101 @@ a **hardcoded list of expected values** does not generalize past this dataset:
 If extending this tool to a new dataset, expect to need new entries in the hardcoded
 dictionaries/lists above.
 
-## Phase 3 — LLM integration: model/cost research (blocked on API keys, not yet built)
+## Phase 3, slice 1 — LLM-assisted branch/degree resolution (done — gpt-5-nano)
 
 The 4-phase roadmap for this project is: (1) degree-agnostic + package-unit-agnostic
-rework — **done**, see Architecture above; (2) test suite — **done**, see "If you
-(Claude Code) are picking this up fresh" below; (3) introduce an LLM into the pipeline
-to resolve cases that currently dead-end in manual review; (4) convert to a real app +
-deployment strategy + design refresh. Phase 3 is **blocked on the user supplying API
-keys** — no LLM-calling code has been written yet. What follows is the cost/model
-research done ahead of that, so the decision is ready the moment keys exist.
+rework — **done**; (2) test suite — **done**; (3) introduce an LLM into the pipeline to
+resolve cases that currently dead-end in manual review; (4) real deployment + design
+refresh — **deployment done**, design refresh still pending. Phase 3 is being built one
+task at a time (of the three identified below) — **slice 1 (branch/degree resolution)
+is built and live**; company-clustering and package-unit-plausibility are still
+deferred, per the user's explicit "start with one slice" choice.
+
+**How it works, end to end:** the normal cleaning pipeline is completely unchanged —
+free, instant, deterministic, exactly as before. A new **"Try AI resolution"** button
+(`tryAiBtn`/`tryAiBtn2`) appears in the Step 1/Step 2 results only when there are rows
+flagged `unrecognized_branch`/`unrecognized_degree` — clicking it is the *only* way this
+feature ever runs, so a real API call, and its cost, only happens when the user
+deliberately asks. On click, `runLlmBranchResolution()` ([index.html](index.html))
+collects the **distinct** raw branch/degree strings among those rows (batched — resolve
+each unique string once, not once per row) and POSTs `{kind:'branch', payload:{values}}`
+to `/api/llm-resolve` ([api/llm-resolve.mjs](api/llm-resolve.mjs)), which calls OpenAI's
+**Responses API** (verified against current docs, not assumed from training data —
+`POST https://api.openai.com/v1/responses`, not the older Chat Completions shape) with
+model **`gpt-5-nano`** and a strict JSON schema (`{resolutions:[{input, degree, branch,
+confidence}]}`).
+
+Each returned resolution with `confidence >= LLM_BRANCH_CONFIDENCE_THRESHOLD` (0.7) gets
+applied via `applyLlmBranchResolutions()`: the matching row is **fully reprocessed**
+through `processRow2()` with the LLM's `{degree, branch}` forced in (a small, additive
+third parameter, `forcedDegreeBranch`, added to `processRow2` for exactly this) — not
+just patched, because a row that failed on branch/degree never got its company/package
+processed either (`processRow2` short-circuits once a row is excluded), so a naive patch
+would ship a row with `company: null`. The row is tagged `llm_resolved_branch` (new
+**medium**-severity `ISSUE_CATALOG` entry — a model's classification decision is
+audit-visible, never silent, same philosophy as every other auto-fix in this tool).
+Below-threshold resolutions are logged but leave the row in `Needs_Manual_Review`
+exactly as before — nothing is ever forced through on a low-confidence guess.
+
+**Duplicate/conflict detection is re-run afterward, not skipped**
+(`reprocessAfterLlmResolution()`) — a newly-resolved row can now exactly match an
+already-included row on year+degree+branch+company+package, or shift a company-name
+cluster's canonical spelling. `flagPackageConflicts`/`clusterCompanies` recompute from
+scratch but *push* tags onto rows rather than replacing them, so re-running them without
+first clearing the `package_conflict`/`company_variant_merged` tags they own would
+double-flag already-tagged rows on a second AI-resolution round — cleared first, every
+time, so repeated runs stay safe. `removeDuplicates` needs no such clearing (it already
+skips `r.excluded` rows, and an excluded duplicate never un-excludes itself).
+
+Every resolution attempted — applied or not — is logged to a new **`LLM_Resolved`**
+export sheet (raw value, resolved degree/branch, confidence, applied yes/no), parallel
+to the existing `Company_Name_Changes` audit sheet, so nothing the model did is hidden.
+
+**UI feedback while the call is in flight and after it completes**: a small CSS spinner
+(`.spinner`, no library) shows next to the status text while the request is pending —
+both are set via the same element's `innerHTML`/`textContent`, so completion always
+replaces the spinner rather than leaving it stuck. After the call resolves,
+`renderLlmDetail()` renders what happened for **every** attempted value inline, always
+visible (never hidden behind a hover tooltip) — input string, what the model resolved it
+to (or "not recognized by the model"), confidence %, and an Applied/Not-applied badge
+reusing the existing `.badge-ok`/`.badge-manual` classes — because a bare "resolved 0 of
+1" count with no explanation looked like a failure even when the model had correctly
+and deliberately declined to guess (confirmed against a real unresolvable value,
+`"BSc Physics"`, which isn't B.Tech or any known non-B.Tech degree at all).
+
+**A real bug the test suite caught before this shipped:** `applied = confidence>=threshold
+&& res.degree && res.branch` — JS's `&&` returns the last operand, not a coerced
+boolean, so a fully-qualified match evaluated `applied` to the string `'Marketing'`
+(truthy, so behaviorally fine everywhere it was used, but not actually a boolean) and a
+null-degree case evaluated it to `null` instead of `false`. Fixed with `!!(...)`. Caught
+by `test/llm-frontend.test.js`, not by manual inspection — reinforces why the mocked-
+logic tests exist even for something that "looked obviously correct."
+
+**Model choice:** `gpt-5-nano` ($0.05/$0.40 per 1M tokens) — chosen by the user
+specifically despite it retiring **2026-12-11**, over the pricier-but-longer-lived
+successor `gpt-5.6-luna` ($0.20/$1.20). **Migrate `MODEL` in `api/llm-resolve.mjs`
+before that date** — re-verify current pricing/availability first, don't just swap the
+string. Env var is `OPENAI_API_KEY`, set in the Vercel dashboard (Project Settings ->
+Environment Variables) — never committed.
+
+**Tested without any real API key or network call**
+(`test/llm-resolve.test.js`, `test/llm-frontend.test.js` — 20 new tests, 66 total in the
+suite): `buildResolutionRequestBody`/`parseResolutionResponse` are pure functions tested
+directly (valid response, model refusal, malformed JSON, wrong shape — all handled
+without throwing); the Vercel handler's `fetch` is mocked for the 200/429/network-error
+paths; the frontend mutation/re-run logic is tested with synthetic rows and synthetic
+resolutions. **What is NOT verified: a real live call to OpenAI** — no key was available
+in this session. That first real call (does the model actually respond usefully, does
+the schema hold up against a live response) still needs to happen manually once the key
+is set in Vercel.
+
+**Still deferred** (company-clustering and package-unit-plausibility LLM tasks) — the
+`{kind, payload}` contract in `api/llm-resolve.mjs` stays open for them; unsupported
+`kind` values still return 501, same as before this slice existed.
+
+---
+
+Below is the original cost/model research this slice was built from, kept for context.
 
 **Where an LLM would actually plug in** (identified from the pipeline's existing
 dead-ends, all of which already fail *safely* — flagged to manual review, never
@@ -382,6 +468,42 @@ inside `api/llm-resolve.mjs` (blocked on keys + a final provider decision).
 One constraint that doesn't go away regardless of hosting choice: a browser app's own
 JS is always inspectable by a determined user — what Vercel actually buys is keeping
 the **API key** server-side, not literally hiding the page's source.
+
+## Real bug found and fixed: CSV upload silently emptied every row (pre-existing, not new)
+
+Found when the user actually uploaded `files/Placement_TestCase_FAIL.csv` through the
+browser and every row came back as "Duplicate/empty rows removed" — confirmed present
+in the **very first commit** (`git show 486e7ea:Placement_Data_Pipeline.html`), so this
+predates the entire degree-agnostic rework and every other change made this session.
+
+**Root cause:** `readFile()`'s CSV branch (via PapaParse) correctly parses the header
+row and hands it to its callback as `headers` — but `handleFile1`/`handleFile2` never
+forwarded that into `resolveSheetMode()`, which only received `sheetHeaders` (always
+`null` for a CSV, since CSVs have no sheet concept). `resolveSheetMode`'s single-sheet
+fallback branch then returned `headers: []`, which silently emptied every column-mapping
+dropdown (`guessColumn([], ...)` → `-1` for everything). Every row's `branch`/`company`/
+`package`/`year` then read as `undefined`, and `processRow2`'s "completely empty row"
+check — which only requires all fields to be blank/null/**undefined** — fired on every
+single row. **XLSX uploads were never affected**: `readFile`'s XLSX branch always builds
+a real `sheetHeaders` array (even for one sheet), so the null-fallback path never
+triggered for XLSX. This is exactly why it went undetected through the real 5-year
+source file, the answer-key XLSX fixtures, and 66 passing automated tests — none of them
+are CSVs uploaded through the actual DOM wiring; they either call `runCleaningPipeline`
+directly with a hand-built mapping (bypassing `resolveSheetMode` entirely) or use XLSX.
+
+**Fix:** `resolveSheetMode()` now takes a `headers` parameter too, falling back to it
+when `sheetHeaders` is unavailable, instead of falling back to `[]`
+([index.html](index.html), `resolveSheetMode`/`handleFile1`/`handleFile2`).
+
+**The methodological gap this exposes, worth remembering:** every test in `test/`
+exercises the deterministic cleaning *logic* thoroughly, but until
+`test/resolve-sheet-mode.test.js` (added alongside this fix), **nothing exercised the
+DOM-wiring layer that actually connects a real file upload to that logic** — column
+auto-detection, sheet-mode resolution, the mapping dropdowns. If you add a new upload
+path or touch `readFile`/`resolveSheetMode`/`handleFile1`/`handleFile2` again, that's the
+class of bug to specifically guard against — a full jsdom-driven click-through test
+(mentioned as aspirational in earlier verification notes but never actually built) would
+close this gap more completely than the current targeted regression test does.
 
 ## A separate, pre-Phase-1 test-fixture set was found mid-session (`files/`, `files.zip`)
 

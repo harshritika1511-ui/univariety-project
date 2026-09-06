@@ -9,5 +9,12 @@ Placement_Data_Clean.xlsx
 Placement_Data_Clean_*.xlsx
 Alumni_Influence_Top_Companies.xlsx
 
+# Local env files (real API keys for local `vercel dev` testing) — never committed.
+.env
+.env.local
+.env*.local
+
 # OS cruft
 .DS_Store
+.vercel
+.env*

@@ -8,11 +8,13 @@ const path = require('path');
 const vm = require('vm');
 
 const EXPORT_NAMES = [
-  'guessColumn', 'parseYear', 'looksLikeYear', 'pickBestSheet',
+  'guessColumn', 'parseYear', 'looksLikeYear', 'pickBestSheet', 'resolveSheetMode',
   'normalizeBranchFull', 'detectDegreeAndBranch', 'parsePackageToRupees',
   'companyNormKey', 'cleanWs', 'processRow2', 'clusterCompanies',
   'removeDuplicates', 'flagPackageConflicts', 'runCleaningPipeline',
   'computeDashboardData',
+  // Phase 3 slice 1 — LLM-assisted branch/degree resolution
+  'reprocessAfterLlmResolution', 'applyLlmBranchResolutions', 'LLM_BRANCH_CONFIDENCE_THRESHOLD',
   'YEAR_PATTERNS', 'BRANCH_PATTERNS', 'COMPANY_PATTERNS', 'PACKAGE_PATTERNS', 'DEGREE_PATTERNS',
   'BRANCH_CANONICAL_LIST', 'DEGREE_ONLY_CODES', 'DEGREE_WITH_SPECIALIZATION_CODES',
   // Alumni path (Path B) — no single entry-point function exists for this path (the
