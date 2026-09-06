@@ -270,11 +270,12 @@ dictionaries/lists above.
 
 The 4-phase roadmap for this project is: (1) degree-agnostic + package-unit-agnostic
 rework — **done**; (2) test suite — **done**; (3) introduce an LLM into the pipeline to
-resolve cases that currently dead-end in manual review; (4) real deployment + design
-refresh — **deployment done**, design refresh still pending. Phase 3 is being built one
-task at a time (of the three identified below) — **slice 1 (branch/degree resolution)
-is built and live**; company-clustering and package-unit-plausibility are still
-deferred, per the user's explicit "start with one slice" choice.
+resolve cases that currently dead-end in manual review — **done, all three slices
+built**; (4) real deployment + design refresh — **deployment done**, design refresh
+still pending (see the TODO/open-items notes near the top of this file). Phase 3 was
+built one slice at a time, starting with just branch/degree resolution per the user's
+explicit "start with one slice" choice, then extended to company-clustering and
+finally package-unit-plausibility once each prior slice was verified live.
 
 **How it works, end to end:** the normal cleaning pipeline is completely unchanged —
 free, instant, deterministic, exactly as before. A new **"Try AI resolution"** button
@@ -523,6 +524,59 @@ above-threshold merge, the below-threshold no-op, the merge-creates-a-duplicate
 re-run-catches-it case, and a defensively-empty `variants` array never applying. All of
 this was also re-verified against the real live endpoint (not just mocked), including
 the exact Reliance/TCS scenario above and a full pipeline→apply→reprocess round-trip.
+
+## Phase 3, slice 3 — LLM package-unit plausibility second opinion (done — gpt-5-nano)
+
+**Third and last of the originally-identified Phase 3 tasks — Phase 3 is now
+complete.** Explicitly the weakest of the three by design, not by accident: it fires
+only on rows already carrying the deterministic `package_unit_assumed_rupees` flag
+(a bare number with no unit text, large enough that `parsePackageToRupees()` assumed it
+was already rupees) — which occurred **zero times** on the real 5-year source file —
+and the model has little more signal than the existing threshold heuristic already
+uses (just a number, no company/role context). Built anyway per the user's explicit
+call to finish the originally-planned scope, but designed to match that weaker signal
+honestly.
+
+**The one real architectural difference from slices 1 and 2, and why it simplified the
+build:** those two *mutate* data because there was a confident alternative value to
+apply (a resolved branch, a merged company name). Here there is no better alternative —
+an implausible bare rupee figure could be a typo, a genuinely unusual stipend, or fine,
+and the model can't produce a corrected number with any real confidence. So **this
+slice never mutates `package` or `excluded` on any row** — `applyLlmPackageChecks()`
+only adds a second, corroborating audit tag (`llm_flagged_package_implausible`, new
+medium `ISSUE_CATALOG` entry) to rows the model specifically doubts. Purely advisory,
+which also means **no re-run of `reprocessAfterLlmResolution()`** — nothing it
+recomputes (duplicates, conflicts, company clustering) is affected by an audit tag,
+unlike slices 1-2 which both need that re-run after mutating data.
+
+**Threshold**: `LLM_PACKAGE_CONFIDENCE_THRESHOLD = 0.7` — matches slice 1, not slice
+2's stricter 0.85, precisely because nothing gets mutated: the worst case of a wrong
+flag here is one extra "worth a look" tag, not corrupted data.
+
+**Verified live** (not just mocked) with a spread of values: `₹1,200` → flagged
+implausible at 0.95 confidence ("far below typical lower bound"); `₹4,50,000` → not
+flagged, 0.25/0.8 confidence in implausibility depending on the run (correctly low,
+since it's a normal figure); `₹12,00,00,000` (₹1.2 crore) → flagged implausible at 0.98
+("extraordinarily high"); `₹25,000` → flagged implausible at 0.92. Full
+pipeline→apply round-trip confirmed the advisory-only guarantee holds: both a flagged
+and an unflagged row kept their exact original `package` value and `excluded:false`
+status — only the `medium` tag differed.
+
+**New export sheet**: `LLM_Package_Check` (Package ₹, Flagged as implausible?,
+Confidence, Model's note) — every value checked, flagged or not, same
+audit-trail-first pattern as `LLM_Resolved`/`LLM_Company_Merges`.
+
+**Tested**: 10 new tests (91 total) — request/response pure functions and mocked-fetch
+handler tests for `kind:'package_unit'`, plus `applyLlmPackageChecks` tests confirming
+the advisory-only guarantee (package/excluded never touched), the below-threshold and
+`implausible:false` no-ops, and that a row outside the eligible set (e.g. one whose
+package already had explicit unit text) is never tagged even if its numeric value
+happens to coincide with a checked one.
+
+**Since the real dataset has zero eligible rows for this feature**, exercising it
+requires a synthetic file with a deliberately implausible bare rupee figure (e.g.
+`"1200"` with no unit text) — none of the existing `files/` fixtures trigger it; add
+one if manual/live re-verification is needed later.
 
 ## Real bug found and fixed: CSV upload silently emptied every row (pre-existing, not new)
 

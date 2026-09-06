@@ -8,6 +8,7 @@ const { loadPipeline } = require('./harness');
 const {
   runCleaningPipeline, applyLlmBranchResolutions, reprocessAfterLlmResolution,
   LLM_BRANCH_CONFIDENCE_THRESHOLD, applyLlmCompanyMerges, LLM_COMPANY_CONFIDENCE_THRESHOLD,
+  applyLlmPackageChecks, LLM_PACKAGE_CONFIDENCE_THRESHOLD,
 } = loadPipeline();
 
 function buildRows(rowsData){
@@ -165,4 +166,51 @@ test('applyLlmCompanyMerges: a merge with an empty variants array is never appli
   ], LLM_COMPANY_CONFIDENCE_THRESHOLD);
   assert.equal(log[0].applied, false);
   assert.equal(rows[0].company, 'TCS');
+});
+
+test('applyLlmPackageChecks: above-threshold implausible flags the row without touching package or excluded', () => {
+  const rows = buildRows([
+    { Year: '2023-24', Degree: '', Branch: 'CSE', Company: 'TCS', Package: '1200' }, // bare, >=1000 -> package_unit_assumed_rupees
+  ]);
+  assert.ok(rows[0].minor.includes('package_unit_assumed_rupees'));
+  assert.equal(rows[0].package, 1200);
+
+  const log = applyLlmPackageChecks(rows, [
+    { value: 1200, implausible: true, confidence: 0.9, note: 'far too low for an annual package' },
+  ], LLM_PACKAGE_CONFIDENCE_THRESHOLD);
+
+  assert.equal(log[0].applied, true);
+  assert.equal(rows[0].package, 1200, 'package value must never be mutated by this slice');
+  assert.equal(rows[0].excluded, false, 'row must stay included — this is advisory only');
+  assert.ok(rows[0].medium.includes('llm_flagged_package_implausible'));
+});
+
+test('applyLlmPackageChecks: implausible:false is logged but never flags the row', () => {
+  const rows = buildRows([{ Year: '2023-24', Degree: '', Branch: 'CSE', Company: 'TCS', Package: '1200' }]);
+  const log = applyLlmPackageChecks(rows, [
+    { value: 1200, implausible: false, confidence: 0.95, note: 'within normal range' },
+  ], LLM_PACKAGE_CONFIDENCE_THRESHOLD);
+  assert.equal(log[0].applied, false);
+  assert.ok(!rows[0].medium.includes('llm_flagged_package_implausible'));
+});
+
+test('applyLlmPackageChecks: below-threshold confidence never flags even if implausible:true', () => {
+  const rows = buildRows([{ Year: '2023-24', Degree: '', Branch: 'CSE', Company: 'TCS', Package: '1200' }]);
+  const log = applyLlmPackageChecks(rows, [
+    { value: 1200, implausible: true, confidence: 0.4, note: 'maybe too low' },
+  ], LLM_PACKAGE_CONFIDENCE_THRESHOLD);
+  assert.equal(log[0].applied, false);
+  assert.ok(!rows[0].medium.includes('llm_flagged_package_implausible'));
+});
+
+test('applyLlmPackageChecks: never touches a row outside the eligible set even if its package value happens to match', () => {
+  const rows = buildRows([
+    { Year: '2023-24', Degree: '', Branch: 'CSE', Company: 'TCS', Package: '1200 LPA' }, // has unit text -> NOT package_unit_assumed_rupees
+  ]);
+  assert.ok(!rows[0].minor.includes('package_unit_assumed_rupees'));
+  const log = applyLlmPackageChecks(rows, [
+    { value: 120000000, implausible: true, confidence: 0.99, note: 'absurdly high' },
+  ], LLM_PACKAGE_CONFIDENCE_THRESHOLD);
+  assert.equal(log[0].applied, true); // logged as applied (would-be match)...
+  assert.ok(!rows[0].medium.includes('llm_flagged_package_implausible'), 'but the row itself is not eligible, so it must not be tagged');
 });

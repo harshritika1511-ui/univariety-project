@@ -93,13 +93,13 @@ test('handler: missing OPENAI_API_KEY returns 501, never calls fetch', async (t)
   assert.equal(fetchCalled, false);
 });
 
-test('handler: unsupported kind returns 501 (contract stays open for the deferred package-unit slice)', async (t) => {
+test('handler: unsupported kind returns 501 (contract stays open for any future slice)', async (t) => {
   const { default: handler } = await loadModule();
   process.env.OPENAI_API_KEY = 'test-key-not-real';
   t.after(() => { delete process.env.OPENAI_API_KEY; });
 
   const res = makeRes();
-  await handler({ method: 'POST', body: { kind: 'package_unit', payload: { values: ['x'] } } }, res);
+  await handler({ method: 'POST', body: { kind: 'something_else', payload: { values: ['x'] } } }, res);
   assert.equal(res.statusCode, 501);
 });
 
@@ -233,6 +233,77 @@ test('handler: kind=company OpenAI HTTP error is surfaced as 502', async (t) => 
 
   const res = makeRes();
   await handler({ method: 'POST', body: { kind: 'company', payload: { values: ['TCS'] } } }, res);
+  assert.equal(res.statusCode, 502);
+  assert.ok(res.body.error.includes('server error'));
+});
+
+/* ===================== slice 3: package-unit plausibility (advisory only) ===================== */
+
+test('buildPackageCheckRequestBody: correct model, roles, and embedded values', async () => {
+  const { buildPackageCheckRequestBody } = await loadModule();
+  const body = buildPackageCheckRequestBody([1200, 450000]);
+  assert.equal(body.model, 'gpt-5-nano');
+  assert.deepEqual(JSON.parse(body.input[1].content), { values: [1200, 450000] });
+  assert.equal(body.text.format.type, 'json_schema');
+  assert.equal(body.text.format.strict, true);
+  assert.equal(body.text.format.schema.required[0], 'checks');
+});
+
+test('parsePackageCheckResponse: valid structured-output response', async () => {
+  const { parsePackageCheckResponse } = await loadModule();
+  const openaiResponse = { output: [{ type: 'message', content: [{ type: 'output_text', text: JSON.stringify({
+    checks: [{ value: 1200, implausible: true, confidence: 0.9, note: 'far too low for an annual package' }],
+  }) }] }] };
+  const result = parsePackageCheckResponse(openaiResponse);
+  assert.equal(result.ok, true);
+  assert.equal(result.checks[0].implausible, true);
+});
+
+test('parsePackageCheckResponse: refusal is surfaced, not silently empty', async () => {
+  const { parsePackageCheckResponse } = await loadModule();
+  const result = parsePackageCheckResponse({ output: [{ type: 'message', content: [{ type: 'refusal', refusal: 'no' }] }] });
+  assert.equal(result.ok, false);
+  assert.ok(result.error.includes('refused'));
+});
+
+test('parsePackageCheckResponse: wrong shape (checks not an array) is rejected', async () => {
+  const { parsePackageCheckResponse } = await loadModule();
+  const openaiResponse = { output: [{ type: 'message', content: [{ type: 'output_text', text: JSON.stringify({ checks: 'nope' }) }] }] };
+  const result = parsePackageCheckResponse(openaiResponse);
+  assert.equal(result.ok, false);
+});
+
+test('handler: kind=package_unit success path returns parsed checks', async (t) => {
+  const { default: handler } = await loadModule();
+  process.env.OPENAI_API_KEY = 'test-key-not-real';
+  const originalFetch = global.fetch;
+  global.fetch = async (url, opts) => {
+    const sentBody = JSON.parse(opts.body);
+    assert.equal(sentBody.text.format.name, 'package_plausibility_checks');
+    return {
+      ok: true,
+      json: async () => ({ output: [{ type: 'message', content: [{ type: 'output_text', text: JSON.stringify({
+        checks: [{ value: 1200, implausible: true, confidence: 0.9, note: 'too low' }],
+      }) }] }] }),
+    };
+  };
+  t.after(() => { global.fetch = originalFetch; delete process.env.OPENAI_API_KEY; });
+
+  const res = makeRes();
+  await handler({ method: 'POST', body: { kind: 'package_unit', payload: { values: [1200] } } }, res);
+  assert.equal(res.statusCode, 200);
+  assert.equal(res.body.checks[0].implausible, true);
+});
+
+test('handler: kind=package_unit OpenAI HTTP error is surfaced as 502', async (t) => {
+  const { default: handler } = await loadModule();
+  process.env.OPENAI_API_KEY = 'test-key-not-real';
+  const originalFetch = global.fetch;
+  global.fetch = async () => ({ ok: false, status: 500, json: async () => ({ error: { message: 'server error' } }) });
+  t.after(() => { global.fetch = originalFetch; delete process.env.OPENAI_API_KEY; });
+
+  const res = makeRes();
+  await handler({ method: 'POST', body: { kind: 'package_unit', payload: { values: [1200] } } }, res);
   assert.equal(res.statusCode, 502);
   assert.ok(res.body.error.includes('server error'));
 });

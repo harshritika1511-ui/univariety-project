@@ -157,6 +157,70 @@ export function parseCompanyMergeResponse(json) {
   return { ok: true, groups: parsed.groups };
 }
 
+/* ===================== slice 3: package-unit plausibility (advisory only) ===================== */
+
+const PACKAGE_SYSTEM_PROMPT = `You are given a list of numbers, each an amount in Indian rupees (INR) that a placement-data cleaning tool has already parsed as a candidate's ANNUAL package for a campus placement offer (engineering or management graduate, India). Each number reached you specifically because it had no unit text at all in the source data and was a judgment call to interpret as already being in rupees — you are a second opinion on that judgment, not the only check.
+
+A typical annual package for this population is roughly ₹2,00,000 to ₹1,00,00,000. For each number, decide whether it is IMPLAUSIBLE as an annual rupee package (e.g. far too low to be a real annual salary, or absurdly high) and give a confidence in that implausibility judgment from 0 to 1, plus a short note explaining why.
+
+This is advisory only — nothing gets changed automatically based on your answer, a human reviews anything flagged. So if a number is genuinely borderline or you are not sure, give it a LOW confidence rather than forcing a implausible:true or false verdict either way.`;
+
+const PACKAGE_CHECK_SCHEMA = {
+  type: 'object',
+  properties: {
+    checks: {
+      type: 'array',
+      items: {
+        type: 'object',
+        properties: {
+          value: { type: 'number' },
+          implausible: { type: 'boolean' },
+          confidence: { type: 'number' },
+          note: { type: 'string' },
+        },
+        required: ['value', 'implausible', 'confidence', 'note'],
+        additionalProperties: false,
+      },
+    },
+  },
+  required: ['checks'],
+  additionalProperties: false,
+};
+
+export function buildPackageCheckRequestBody(values) {
+  return {
+    model: MODEL,
+    input: [
+      { role: 'system', content: PACKAGE_SYSTEM_PROMPT },
+      { role: 'user', content: JSON.stringify({ values }) },
+    ],
+    text: {
+      format: {
+        type: 'json_schema',
+        name: 'package_plausibility_checks',
+        strict: true,
+        schema: PACKAGE_CHECK_SCHEMA,
+      },
+    },
+  };
+}
+
+export function parsePackageCheckResponse(json) {
+  const { text, refusal } = extractOutputText(json);
+  if (refusal) return { ok: false, error: `Model refused: ${refusal}` };
+  if (!text) return { ok: false, error: 'No output text in response' };
+  let parsed;
+  try {
+    parsed = JSON.parse(text);
+  } catch (e) {
+    return { ok: false, error: 'Response was not valid JSON: ' + e.message };
+  }
+  if (!parsed || !Array.isArray(parsed.checks)) {
+    return { ok: false, error: 'Response JSON did not match the expected {checks: [...]} shape' };
+  }
+  return { ok: true, checks: parsed.checks };
+}
+
 /* ===================== shared plumbing ===================== */
 
 function extractOutputText(json) {
@@ -231,5 +295,14 @@ export default async function handler(req, res) {
     return;
   }
 
-  res.status(501).json({ error: `LLM resolution for kind "${kind}" is not implemented yet — only "branch" and "company" are built so far.` });
+  if (kind === 'package_unit') {
+    const call = await callOpenAI(buildPackageCheckRequestBody(values));
+    if (!call.ok) { res.status(call.status).json({ error: call.error }); return; }
+    const result = parsePackageCheckResponse(call.json);
+    if (!result.ok) { res.status(502).json({ error: result.error }); return; }
+    res.status(200).json({ checks: result.checks });
+    return;
+  }
+
+  res.status(501).json({ error: `LLM resolution for kind "${kind}" is not implemented yet — only "branch", "company", and "package_unit" are built so far.` });
 }

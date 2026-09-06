@@ -246,6 +246,11 @@
           <span id="tryAiCompanyStatus" style="font-size:12.5px; color:var(--muted);"></span>
         </div>
         <ul id="tryAiCompanyDetail" style="margin:8px 0 0 0; padding:0; list-style:none;"></ul>
+        <div class="btn-row" style="margin-top:8px;">
+          <button class="btn secondary" id="tryAiPackageBtn" style="display:none;">Try AI package check</button>
+          <span id="tryAiPackageStatus" style="font-size:12.5px; color:var(--muted);"></span>
+        </div>
+        <ul id="tryAiPackageDetail" style="margin:8px 0 0 0; padding:0; list-style:none;"></ul>
       </div>
       </div>
 
@@ -377,6 +382,11 @@
           <span id="tryAiCompanyStatus2" style="font-size:12.5px; color:var(--muted);"></span>
         </div>
         <ul id="tryAiCompanyDetail2" style="margin:8px 0 0 0; padding:0; list-style:none;"></ul>
+        <div class="btn-row" style="margin-top:8px;">
+          <button class="btn secondary" id="tryAiPackageBtn2" style="display:none;">Try AI package check</button>
+          <span id="tryAiPackageStatus2" style="font-size:12.5px; color:var(--muted);"></span>
+        </div>
+        <ul id="tryAiPackageDetail2" style="margin:8px 0 0 0; padding:0; list-style:none;"></ul>
       </div>
     </section>
 
@@ -471,6 +481,7 @@ const ISSUE_CATALOG = {
   branch_unnormalized_degree: {sev:'medium', text:'Program has no canonical specialization list yet', detail:'This degree (e.g. MBA, M.Tech) carries a specialization/branch, but there is no dictionary of canonical names for it the way B.Tech has. The value was generically cleaned (whitespace/case) but not standardized against a known list.'},
   llm_resolved_branch: {sev:'medium', text:'Branch/degree resolved with AI assistance', detail:'This row’s branch/degree value did not match any known dictionary or pattern, so it was sent to an LLM for classification (only when the user explicitly clicked "Try AI resolution"). The model’s answer was accepted because its confidence met the threshold — see the LLM_Resolved sheet for the exact confidence score and every value that was attempted, including ones below the threshold that were left for manual review.'},
   llm_resolved_company: {sev:'medium', text:'Company name merged with AI assistance', detail:'This company name looked different enough from another entry (e.g. an abbreviation vs. a full legal name) that the generic clustering pass did not merge them automatically. An LLM proposed the merge (only when the user explicitly clicked "Try AI company matching") and it was accepted because its confidence met the stricter threshold used for company merges — see the LLM_Company_Merges sheet for the exact confidence and every group that was attempted, including ones below the threshold that were left unmerged.'},
+  llm_flagged_package_implausible: {sev:'medium', text:'AI flagged this package figure as implausible', detail:'This package value had no unit text at all and was already a judgment call to interpret as absolute rupees (see the package_unit_assumed_rupees flag). An LLM gave a second opinion (only when the user explicitly clicked "Try AI package check") and specifically doubted this figure as a plausible annual placement package. This is advisory only — the value was NOT changed automatically — see the LLM_Package_Check sheet for the model’s note and confidence, and check it manually.'},
   // MINOR — cosmetic
   whitespace_trimmed:   {sev:'minor',  text:'Leading, trailing, or repeated whitespace', detail:'Extra spaces around or inside a value were trimmed.'},
   nbsp_fixed:           {sev:'minor',  text:'Non-breaking space or invisible character', detail:'A non-breaking space (invisible in Excel) was found inside a value and replaced with a normal space.'},
@@ -885,7 +896,7 @@ document.querySelectorAll('#stepNav li').forEach(li=>{
 let step1Done=false, step2Done=false;
 let rawHeaders=[], rawRows=[], rawSheetNames=null, rawSheetHeaders=null;
 let allRows1=[], rawSheetNamesFull1=[], rawSheetHeadersFull1=[]; // unfiltered, for the sheet-picker to re-slice
-let processedRows=[], companyAudit=[], packageConflicts=[], duplicateExamples=[], llmResolutionsLog=[], llmCompanyMergeLog=[];
+let processedRows=[], companyAudit=[], packageConflicts=[], duplicateExamples=[], llmResolutionsLog=[], llmCompanyMergeLog=[], llmPackageCheckLog=[];
 
 /* Decide how to handle a multi-sheet upload: if every sheet name looks like a year, treat it as
    one-tab-per-year (existing behaviour). Otherwise the sheets are probably different SECTIONS of
@@ -1031,6 +1042,11 @@ const LLM_BRANCH_CONFIDENCE_THRESHOLD = 0.7;
    classification just leaves a row in manual review (safe); a wrong company merge
    actively corrupts good data by force-combining two different real companies. */
 const LLM_COMPANY_CONFIDENCE_THRESHOLD = 0.85;
+/* Slice 3 (package plausibility) never mutates data — it only adds an advisory flag to
+   a row already carrying the deterministic package_unit_assumed_rupees flag, so it's
+   safe to use the same lower threshold as slice 1 rather than slice 2's stricter one:
+   the worst case of a wrong flag here is one extra "worth a look" tag, not corrupted data. */
+const LLM_PACKAGE_CONFIDENCE_THRESHOLD = 0.7;
 
 /* Re-runs the parts of the pipeline that operate on the full row set from scratch
    (company clustering, duplicate detection, package conflicts) after LLM resolution
@@ -1150,6 +1166,52 @@ async function runLlmCompanyMerge(rows, headerIssueCount, ids, llmLog, llmCompan
   }
 }
 
+/* Advisory only — unlike applyLlmBranchResolutions/applyLlmCompanyMerges, this never
+   mutates package/excluded on any row. It only adds an audit tag to rows the model
+   specifically doubts, so there is no re-run of reprocessAfterLlmResolution: nothing it
+   recomputes (duplicates/conflicts/company clustering) is affected by an audit tag. */
+function applyLlmPackageChecks(rows, checks, threshold){
+  const log = [];
+  checks.forEach(c=>{
+    const flagged = !!(c.implausible && c.confidence>=threshold);
+    log.push({ value: c.value, implausible: !!c.implausible, confidence: c.confidence, note: c.note||'', applied: flagged });
+    if (!flagged) return;
+    rows.forEach(r=>{
+      if (r.excluded || r.package!==c.value) return;
+      if (!r.minor.includes('package_unit_assumed_rupees')) return;
+      if (!r.medium.includes('llm_flagged_package_implausible')) r.medium.push('llm_flagged_package_implausible');
+    });
+  });
+  return log;
+}
+
+async function runLlmPackageCheck(rows, headerIssueCount, ids, audit, conflicts, llmLog, llmCompanyLog, llmPackageLog, onContinue){
+  const btn = document.getElementById(ids.tryAiPackageBtn), status = document.getElementById(ids.tryAiPackageStatus);
+  const values = [...new Set(rows.filter(r=>!r.excluded && r.minor.includes('package_unit_assumed_rupees')).map(r=>r.package))];
+  btn.disabled = true;
+  status.innerHTML = `<span class="spinner"></span>Checking ${values.length} package value${values.length===1?'':'s'} with AI…`;
+  try{
+    const resp = await fetch('/api/llm-resolve', {
+      method:'POST', headers:{'Content-Type':'application/json'},
+      body: JSON.stringify({ kind:'package_unit', payload:{ values } })
+    });
+    const data = await resp.json().catch(()=>({}));
+    if (resp.status===501){ status.textContent = data.error || 'AI resolution isn’t configured yet.'; btn.disabled=false; return; }
+    if (!resp.ok){ status.textContent = 'AI package check failed: ' + (data.error||`HTTP ${resp.status}`); btn.disabled=false; return; }
+
+    const newLogEntries = applyLlmPackageChecks(rows, data.checks||[], LLM_PACKAGE_CONFIDENCE_THRESHOLD);
+    llmPackageLog.push(...newLogEntries);
+    const flaggedCount = newLogEntries.filter(l=>l.applied).length;
+    renderStepResults(rows, headerIssueCount, ids, audit, conflicts, onContinue, llmLog, llmCompanyLog, llmPackageLog);
+    document.getElementById(ids.tryAiPackageStatus).textContent = newLogEntries.length
+      ? `AI flagged ${flaggedCount} of ${newLogEntries.length} checked value${newLogEntries.length===1?'':'s'} as implausible — see the LLM_Package_Check sheet for details.`
+      : `No implausible package values found by AI.`;
+  } catch(e){
+    status.textContent = 'AI package check failed: ' + e.message;
+    btn.disabled = false;
+  }
+}
+
 document.getElementById('analyzeBtn').addEventListener('click', ()=>{
   const noYearCol = document.getElementById('noYearCol').checked;
   const fromSheet = document.getElementById('yearFromSheet').checked;
@@ -1168,22 +1230,26 @@ document.getElementById('analyzeBtn').addEventListener('click', ()=>{
   processedRows = result.rows;
   llmResolutionsLog = [];
   llmCompanyMergeLog = [];
-  renderStepResults(result.rows, result.headerIssueCount, STEP1_IDS, companyAudit, packageConflicts, ()=> setStepActive(2), llmResolutionsLog, llmCompanyMergeLog);
+  llmPackageCheckLog = [];
+  renderStepResults(result.rows, result.headerIssueCount, STEP1_IDS, companyAudit, packageConflicts, ()=> setStepActive(2), llmResolutionsLog, llmCompanyMergeLog, llmPackageCheckLog);
   step1Done=true;
 });
 
 const STEP1_IDS = {statRow:'statRow1', insight:'insight1', resultsCard:'resultsCard', issuesCard:'issuesCard', issuesReport:'issuesReport',
   previewCard:'previewCard', previewBody:'previewBody', downloadReviewBtn:'downloadReviewBtn', downloadWorkbookBtn:'downloadWorkbookBtn', continueBtn:'toStep2Btn',
   tryAiBtn:'tryAiBtn', tryAiStatus:'tryAiStatus', tryAiDetail:'tryAiDetail',
-  tryAiCompanyBtn:'tryAiCompanyBtn', tryAiCompanyStatus:'tryAiCompanyStatus', tryAiCompanyDetail:'tryAiCompanyDetail'};
+  tryAiCompanyBtn:'tryAiCompanyBtn', tryAiCompanyStatus:'tryAiCompanyStatus', tryAiCompanyDetail:'tryAiCompanyDetail',
+  tryAiPackageBtn:'tryAiPackageBtn', tryAiPackageStatus:'tryAiPackageStatus', tryAiPackageDetail:'tryAiPackageDetail'};
 const STEP2_IDS = {statRow:'statRow2', insight:'insight2', resultsCard:'resultsCard2', issuesCard:'issuesCard2', issuesReport:'issuesReport2',
   previewCard:'previewCard2', previewBody:'previewBody2', downloadReviewBtn:'downloadReviewBtn2', downloadWorkbookBtn:'downloadWorkbookBtn2', continueBtn:'generateBtn',
   tryAiBtn:'tryAiBtn2', tryAiStatus:'tryAiStatus2', tryAiDetail:'tryAiDetail2',
-  tryAiCompanyBtn:'tryAiCompanyBtn2', tryAiCompanyStatus:'tryAiCompanyStatus2', tryAiCompanyDetail:'tryAiCompanyDetail2'};
+  tryAiCompanyBtn:'tryAiCompanyBtn2', tryAiCompanyStatus:'tryAiCompanyStatus2', tryAiCompanyDetail:'tryAiCompanyDetail2',
+  tryAiPackageBtn:'tryAiPackageBtn2', tryAiPackageStatus:'tryAiPackageStatus2', tryAiPackageDetail:'tryAiPackageDetail2'};
 
-function renderStepResults(rows, headerIssueCount, ids, audit, conflicts, onContinue, llmLog, llmCompanyLog){
+function renderStepResults(rows, headerIssueCount, ids, audit, conflicts, onContinue, llmLog, llmCompanyLog, llmPackageLog){
   llmLog = llmLog || [];
   llmCompanyLog = llmCompanyLog || [];
+  llmPackageLog = llmPackageLog || [];
   const needsReview = rows.filter(r=>r.excluded && r.removalBucket==='review');
   const autoRemoved = rows.filter(r=>r.excluded && r.removalBucket==='auto');
   const included = rows.filter(r=>!r.excluded);
@@ -1225,7 +1291,7 @@ function renderStepResults(rows, headerIssueCount, ids, audit, conflicts, onCont
     const blob = new Blob([csv], {type:'text/csv'});
     const a = document.createElement('a'); a.href=URL.createObjectURL(blob); a.download='review_file.csv'; a.click();
   };
-  document.getElementById(ids.downloadWorkbookBtn).onclick = ()=> buildAndDownloadWorkbook(included, needsReview, autoRemoved, audit, conflicts, llmLog, llmCompanyLog);
+  document.getElementById(ids.downloadWorkbookBtn).onclick = ()=> buildAndDownloadWorkbook(included, needsReview, autoRemoved, audit, conflicts, llmLog, llmCompanyLog, llmPackageLog);
   document.getElementById(ids.continueBtn).onclick = onContinue;
 
   const aiEligible = needsReview.filter(r=>r.major.includes('unrecognized_branch')||r.major.includes('unrecognized_degree'));
@@ -1253,6 +1319,19 @@ function renderStepResults(rows, headerIssueCount, ids, audit, conflicts, onCont
     document.getElementById(ids.tryAiCompanyStatus).textContent = '';
   }
   renderLlmCompanyDetail(ids, llmCompanyLog);
+
+  const packageCheckEligible = included.filter(r=>r.minor.includes('package_unit_assumed_rupees'));
+  const tryAiPackageBtn = document.getElementById(ids.tryAiPackageBtn);
+  if (packageCheckEligible.length){
+    tryAiPackageBtn.style.display = 'inline-block';
+    tryAiPackageBtn.disabled = false;
+    tryAiPackageBtn.textContent = `Try AI package check (${packageCheckEligible.length} row${packageCheckEligible.length===1?'':'s'})`;
+    tryAiPackageBtn.onclick = ()=> runLlmPackageCheck(rows, headerIssueCount, ids, audit, conflicts, llmLog, llmCompanyLog, llmPackageLog, onContinue);
+  } else {
+    tryAiPackageBtn.style.display = 'none';
+    document.getElementById(ids.tryAiPackageStatus).textContent = '';
+  }
+  renderLlmPackageDetail(ids, llmPackageLog);
 }
 
 /* Renders exactly what happened for every value the AI was asked to resolve — never
@@ -1285,6 +1364,22 @@ function renderLlmCompanyDetail(ids, llmCompanyLog){
       ? `<span class="badge badge-ok">Merged</span>`
       : `<span class="badge badge-manual">Not merged — below confidence threshold</span>`;
     return `<li class="note" style="margin-bottom:4px;">${variantsText} → <b>"${String(l.canonical).replace(/</g,'&lt;')}"</b> (${pct}% confidence) ${badge}</li>`;
+  }).join('');
+}
+
+/* Same always-visible philosophy as the other two detail renderers. Advisory-only badge
+   wording ("Flagged for review" / "Looks fine") since, unlike branch/company, nothing
+   here was ever mutated — this is a second opinion, not a fix. */
+function renderLlmPackageDetail(ids, llmPackageLog){
+  const el = document.getElementById(ids.tryAiPackageDetail);
+  if (!llmPackageLog || !llmPackageLog.length){ el.innerHTML = ''; return; }
+  el.innerHTML = llmPackageLog.map(l=>{
+    const pct = Math.round((l.confidence||0)*100);
+    const badge = l.applied
+      ? `<span class="badge badge-manual">Flagged for review</span>`
+      : `<span class="badge badge-ok">Looks fine to AI</span>`;
+    const note = l.note ? ` — ${String(l.note).replace(/</g,'&lt;')}` : '';
+    return `<li class="note" style="margin-bottom:4px;"><b>${fmtPkg(l.value)}</b> (${pct}% confidence${note}) ${badge}</li>`;
   }).join('');
 }
 
@@ -1329,7 +1424,7 @@ function renderIssuesReport(rows, headerIssueCount, conflicts, containerId){
 }
 
 /* ---------------- clean workbook export (.xlsx) ---------------- */
-function buildAndDownloadWorkbook(included, needsReview, autoRemoved, audit, conflicts, llmLog, llmCompanyLog){
+function buildAndDownloadWorkbook(included, needsReview, autoRemoved, audit, conflicts, llmLog, llmCompanyLog, llmPackageLog){
   const wb = XLSX.utils.book_new();
   const years = [...new Set(included.map(r=>r.year))].sort();
   // distinct (degree, branch) pairs — this is the real grouping key now, not branch alone,
@@ -1430,6 +1525,17 @@ function buildAndDownloadWorkbook(included, needsReview, autoRemoved, audit, con
       llmCompanyLog.map(l=>[(l.variants||[]).join(' / '), l.canonical??'', l.confidence, l.applied?'Yes':'No (below confidence threshold)'])
     );
     XLSX.utils.book_append_sheet(wb, XLSX.utils.aoa_to_sheet(llmCoAoa), 'LLM_Company_Merges');
+  }
+
+  // LLM_Package_Check — every AI package-plausibility check attempted, flagged or not.
+  // Advisory only: no package value was ever changed by this slice, so this sheet is
+  // purely a prioritized shortlist within the existing package_unit_assumed_rupees rows
+  // for a human to look at, not a record of automatic fixes.
+  if (llmPackageLog && llmPackageLog.length){
+    const llmPkgAoa = [['Package (₹)','Flagged as implausible?','Confidence',"Model's note"]].concat(
+      llmPackageLog.map(l=>[l.value, l.applied?'Yes':'No', l.confidence, l.note||''])
+    );
+    XLSX.utils.book_append_sheet(wb, XLSX.utils.aoa_to_sheet(llmPkgAoa), 'LLM_Package_Check');
   }
 
   XLSX.writeFile(wb, 'Placement_Data_Clean.xlsx');
@@ -1672,7 +1778,7 @@ file2.addEventListener('change', ()=>{ if (file2.files[0]) handleFile2(file2.fil
 
 let rawHeaders2=[], rawRows2=[], rawSheetNames2=null, rawSheetHeaders2=null;
 let allRows2=[], rawSheetNamesFull2=[], rawSheetHeadersFull2=[];
-let companyAudit2=[], packageConflicts2=[], processedRows2=[], llmResolutionsLog2=[], llmCompanyMergeLog2=[];
+let companyAudit2=[], packageConflicts2=[], processedRows2=[], llmResolutionsLog2=[], llmCompanyMergeLog2=[], llmPackageCheckLog2=[];
 function handleFile2(file){
   document.getElementById('file2chip').innerHTML = `<div class="file-chip">${file.name}</div>`;
   readFile(file, (headers, rows, sheetNames, sheetHeaders)=>{
@@ -1740,11 +1846,12 @@ document.getElementById('analyzeBtn2').addEventListener('click', ()=>{
   processedRows2 = result.rows;
   llmResolutionsLog2 = [];
   llmCompanyMergeLog2 = [];
+  llmPackageCheckLog2 = [];
   renderStepResults(result.rows, result.headerIssueCount, STEP2_IDS, companyAudit2, packageConflicts2, ()=>{
     step2Done=true;
     buildDashboard(processedRows2.filter(r=>!r.excluded));
     setStepActive(3);
-  }, llmResolutionsLog2, llmCompanyMergeLog2);
+  }, llmResolutionsLog2, llmCompanyMergeLog2, llmPackageCheckLog2);
 });
 
 /* ---------------- STEP 3: aggregation + dashboard (adapted from sample) ---------------- */
