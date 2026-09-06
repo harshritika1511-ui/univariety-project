@@ -162,6 +162,56 @@ Limited`/`" Wipro "`→`Wipro`, and `"Bosch India"` (nbsp)→`Bosch` all merged 
 
 ---
 
+## 9. `Placement_TestCase_AICompanyMatching.csv`
+**Tests Phase 3 slice 2 (LLM-assisted company near-duplicate clustering) specifically —
+not the deterministic pipeline.** Every company name here deliberately uses a
+*different-looking* real-world equivalent that `companyNormKey()`'s case/whitespace/
+legal-suffix stripping cannot catch (unlike the MIXED files' `Google`/`google`/`GOOGLE`
+or `Tata Motors`/`Tata Motors Ltd.` cases) — so this file passes through the
+deterministic pass **completely unchanged**, on purpose, isolating the AI feature.
+
+**Deterministic baseline (before touching "Try AI company matching"):**
+10 total → 10 included, 0 review, 0 auto-removed, 0 conflicts, 0 flags of any kind.
+10 distinct companies survive untouched: `Amazon`, `Google`, `Infosys`, `Infy`, `L&T`,
+`Larsen & Toubro`, `Reliance Industries`, `Reliance Jio`, `TCS`, `Tata Consultancy
+Services`.
+
+**What each pair tests:**
+- `TCS` / `Tata Consultancy Services` — common abbreviation vs. full legal name → should merge
+- `Infy` / `Infosys` — common colloquial abbreviation → should merge
+- `L&T` / `Larsen & Toubro` — common abbreviation → should merge
+- `Reliance Industries` / `Reliance Jio` — **the trap**: similarly-named but genuinely
+  different companies (same corporate family) → must **NOT** merge
+- `Google`, `Amazon` — control rows with no pair, to confirm the model doesn't force a
+  match where none exists
+
+⚠️ **This result comes from a live model call, not deterministic code — it can vary
+between runs/model updates, unlike every other result in this document.** What's
+recorded below is what `gpt-5-nano` actually returned when this was tested
+(2026-09-07), via `POST /api/llm-resolve` with `kind:'company'` and this file's exact
+10-value distinct-company list, run twice for consistency:
+
+```json
+{"groups":[
+  {"canonical":"Tata Consultancy Services","variants":["TCS"],"confidence":0.95},
+  {"canonical":"Infosys","variants":["Infy"],"confidence":0.95},
+  {"canonical":"Larsen & Toubro","variants":["L&T"],"confidence":0.95}
+]}
+```
+
+All three above the 0.85 auto-merge threshold → all three applied. `Reliance
+Industries`/`Reliance Jio` correctly excluded from every group (not merged). Expected
+result after clicking "Try AI company matching" in the app: distinct-company count
+drops from 10 to 7 (`Tata Consultancy Services`, `Infosys`, `Larsen & Toubro`,
+`Reliance Industries`, `Reliance Jio`, `Google`, `Amazon`), 3 rows tagged
+`llm_resolved_company`, and `LLM_Company_Merges` in the downloaded workbook lists all
+three groups with `Applied? = Yes`. If a live re-test ever shows `Reliance
+Industries`/`Reliance Jio` merged, that's a real regression worth investigating (the
+system prompt explicitly warns against exactly this) — not a "the model changed its
+mind, no big deal" situation.
+
+---
+
 ## How to use this
 
 1. Upload each `Placement_TestCase_*` file to **Step 1** of the tool.
@@ -170,3 +220,8 @@ Limited`/`" Wipro "`→`Wipro`, and `"Bosch India"` (nbsp)→`Bosch` all merged 
 4. Any mismatch is either a real regression or a change in the rules that needs this
    answer key updated to match — treat a disagreement as worth investigating, not
    dismissing.
+5. For `Placement_TestCase_AICompanyMatching.csv` specifically: after uploading and
+   confirming the deterministic baseline (section 9) matches, also click **"Try AI
+   company matching"** — this requires `OPENAI_API_KEY` to be configured (Vercel
+   dashboard, or `.env.local` for `vercel dev`); without it you'll just see "AI
+   resolution isn't configured yet," which is correct, not a failure.

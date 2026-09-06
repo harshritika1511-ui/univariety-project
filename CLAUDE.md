@@ -397,7 +397,7 @@ Sources: [GPT-5 Mini API Cost Breakdown](https://www.getapipulse.com/blog-gpt5-m
 [Gemini API Pricing (BenchLM)](https://benchlm.ai/google/api-pricing),
 [Gemini Pricing 2026 (CloudZero)](https://www.cloudzero.com/blog/gemini-pricing/).
 
-**Recommendation (not yet actioned):** GPT-5 nano as the default model — ~20x cheaper
+**Recommendation (actioned — gpt-5-nano is what both Phase 3 slices actually use):** ~20x cheaper
 than Claude Haiku 4.5 on input for a task shape where that gap in raw capability
 shouldn't matter. Build one small provider-agnostic abstraction (e.g.
 `resolveWithLLM(kind, payload)`), feature-flagged to no-op when no key is configured,
@@ -462,12 +462,67 @@ coexist harmlessly if left alone.
 
 **Deferred to a later step (not done yet):** the actual dashboard visual refresh via
 the `dataviz` skill (visual/color/layout decisions are better made with the skill's
-guidance loaded in the moment, not pre-specified) and Phase 3's real provider call
-inside `api/llm-resolve.mjs` (blocked on keys + a final provider decision).
+guidance loaded in the moment, not pre-specified). Phase 3's real provider call is no
+longer blocked — see the Phase 3 slices below, both now built and live.
 
 One constraint that doesn't go away regardless of hosting choice: a browser app's own
 JS is always inspectable by a determined user — what Vercel actually buys is keeping
 the **API key** server-side, not literally hiding the page's source.
+
+## Phase 3, slice 2 — LLM-assisted company near-duplicate clustering (done — gpt-5-nano)
+
+Second of the two remaining Phase 3 tasks (package-unit-plausibility is the last one,
+still deferred). Same shape as slice 1 — explicit opt-in button, no cost unless
+clicked, same model — but genuinely different risk profile: a wrong branch
+classification just leaves a row in manual review (safe); a wrong company merge
+actively **corrupts** good data by force-combining two different real companies. The
+confidence threshold is deliberately stricter here: **`LLM_COMPANY_CONFIDENCE_THRESHOLD
+= 0.85`** vs. slice 1's 0.7 ([index.html](index.html)).
+
+**What this catches that the deterministic pass doesn't:** `clusterCompanies()` already
+merges exact/case/whitespace/legal-suffix variants automatically, for free, on every
+analyze — unchanged by this slice. What survives that pass are genuinely
+different-looking strings for the same real company — a common abbreviation vs. the
+full legal name (`"TCS"` vs `"Tata Consultancy Services"`), or a misspelling
+`companyNormKey()` can't catch. Unlike slice 1 (per-row), this is a **batch, whole-list**
+task — one call sends the entire current distinct-company list and gets back proposed
+merge *groups* (`{canonical, variants, confidence}`), not a per-item classification.
+
+**The prompt explicitly warns against the failure mode that matters most here** —
+merging similarly-named-but-distinct companies (e.g. "Reliance Industries" and
+"Reliance Jio", or "Tata Motors" and "Tata Consultancy Services") — and instructs the
+model to leave an entry out of every group entirely rather than force a match. **Verified
+live, not just assumed**: given `["TCS","Tata Consultancy Services","Reliance
+Industries","Reliance Jio","Infosys","Google","Accenture Pvt","Accenture"]`, the model
+correctly proposed only `{canonical:"Tata Consultancy Services", variants:["TCS"],
+confidence:0.95}` — it did **not** group Reliance Industries/Jio, and was conservative
+enough not to group "Accenture"/"Accenture Pvt" either (a defensible call, not
+incorrect — better to miss a real match than force a wrong one, matching the "never
+guess when unsure" philosophy this whole tool is built around).
+
+**Same reusable infrastructure as slice 1, deliberately not rebuilt:**
+`reprocessAfterLlmResolution()` is reused as-is — a company merge can just as easily
+create a new exact duplicate or package conflict as a branch resolution can (verified:
+merging two rows down to identical year+degree+branch+company+package correctly gets
+caught and auto-removed by the existing re-run, not double-counted). `applyLlmCompanyMerges()`
+reassigns every included row whose `company` matches a `variant` to the group's
+`canonical`, tags it `llm_resolved_company` (new medium `ISSUE_CATALOG` entry), and logs
+every attempted group — applied or not — to a new **`LLM_Company_Merges`** export sheet
+(a separate sheet from `LLM_Resolved`, not shared: the column shapes genuinely differ —
+a group of variants vs. a single-value resolution).
+
+**UI**: a second button, "Try AI company matching (N companies)", shown whenever there
+are 2+ distinct companies among included rows (i.e. almost always) — same spinner and
+always-visible per-attempt detail list pattern as slice 1, via a sibling renderer
+(`renderLlmCompanyDetail`) since the entry shape differs (variants + canonical, not
+input + degree/branch).
+
+**Tested**: 18 new tests (80 total) — request/response pure functions and mocked-fetch
+handler tests for `kind:'company'`, plus `applyLlmCompanyMerges` tests covering the
+above-threshold merge, the below-threshold no-op, the merge-creates-a-duplicate
+re-run-catches-it case, and a defensively-empty `variants` array never applying. All of
+this was also re-verified against the real live endpoint (not just mocked), including
+the exact Reliance/TCS scenario above and a full pipeline→apply→reprocess round-trip.
 
 ## Real bug found and fixed: CSV upload silently emptied every row (pre-existing, not new)
 

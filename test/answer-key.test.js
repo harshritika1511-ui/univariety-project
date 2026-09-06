@@ -231,3 +231,23 @@ test('answer-key: Alumni_TestCase_MIXED — 16/19 included, company clustering m
   // Corrupted Batch ("#VALUE!") must not gate exclusion — Batch isn't a required field.
   assert.ok(result.rows.some(r => r.batch === '#VALUE!'));
 });
+
+// ---------------------------------------------------------------------------
+// 9. Placement_TestCase_AICompanyMatching.csv — answer key: deterministic baseline only
+// (10/10 included, 0 flags, 10 distinct companies untouched). The AI-assisted part
+// (clicking "Try AI company matching") is a live model call and deliberately NOT
+// automated here — see files/Test_Cases_Answer_Key.md section 9 for that expected
+// result and how to verify it manually.
+// ---------------------------------------------------------------------------
+test('answer-key: Placement_TestCase_AICompanyMatching — deterministic baseline is untouched (10/10, 0 flags)', () => {
+  const result = runPlacement('Placement_TestCase_AICompanyMatching.csv');
+  const included = result.rows.filter(r => !r.excluded);
+  assert.equal(result.rows.length, 10);
+  assert.equal(included.length, 10);
+  assert.equal(included.filter(r => r.major.length || r.medium.length || r.minor.length).length, 0);
+
+  const companies = new Set(included.map(r => r.company));
+  const expectedCompanies = ['Amazon', 'Google', 'Infosys', 'Infy', 'L&T', 'Larsen & Toubro',
+    'Reliance Industries', 'Reliance Jio', 'TCS', 'Tata Consultancy Services'];
+  assert.deepEqual([...companies].sort(), expectedCompanies);
+});

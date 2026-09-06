@@ -7,7 +7,7 @@ const { loadPipeline } = require('./harness');
 
 const {
   runCleaningPipeline, applyLlmBranchResolutions, reprocessAfterLlmResolution,
-  LLM_BRANCH_CONFIDENCE_THRESHOLD,
+  LLM_BRANCH_CONFIDENCE_THRESHOLD, applyLlmCompanyMerges, LLM_COMPANY_CONFIDENCE_THRESHOLD,
 } = loadPipeline();
 
 function buildRows(rowsData){
@@ -106,4 +106,63 @@ test('reprocessAfterLlmResolution: re-running twice does not double-flag an exis
   const second = reprocessAfterLlmResolution(rows); // simulate a second AI-resolution round with nothing new
   assert.equal(second.conflicts.length, 1);
   assert.equal(rows[0].major.filter(t => t === 'package_conflict').length, 1, 'must not accumulate duplicate tags across re-runs');
+});
+
+test('LLM_COMPANY_CONFIDENCE_THRESHOLD is stricter than the branch threshold (different risk profile)', () => {
+  assert.ok(LLM_COMPANY_CONFIDENCE_THRESHOLD > LLM_BRANCH_CONFIDENCE_THRESHOLD);
+  assert.ok(LLM_COMPANY_CONFIDENCE_THRESHOLD > 0 && LLM_COMPANY_CONFIDENCE_THRESHOLD < 1);
+});
+
+test('applyLlmCompanyMerges: above-threshold group merges every matching row, tagged for audit', () => {
+  const rows = buildRows([
+    { Year: '2023-24', Degree: '', Branch: 'CSE', Company: 'TCS', Package: '4.5 LPA' },
+    { Year: '2023-24', Degree: '', Branch: 'Mechanical Engineering', Company: 'Tata Consultancy Services', Package: '8 LPA' },
+  ]);
+  const log = applyLlmCompanyMerges(rows, [
+    { canonical: 'Tata Consultancy Services', variants: ['TCS'], confidence: 0.9 },
+  ], LLM_COMPANY_CONFIDENCE_THRESHOLD);
+
+  assert.equal(log.length, 1);
+  assert.equal(log[0].applied, true);
+  assert.equal(rows[0].company, 'Tata Consultancy Services');
+  assert.ok(rows[0].medium.includes('llm_resolved_company'));
+  assert.equal(rows[1].company, 'Tata Consultancy Services'); // already was, untouched otherwise
+});
+
+test('applyLlmCompanyMerges: below-threshold group is logged but never merges anything', () => {
+  const rows = buildRows([
+    { Year: '2023-24', Degree: '', Branch: 'CSE', Company: 'TCS', Package: '4.5 LPA' },
+  ]);
+  const log = applyLlmCompanyMerges(rows, [
+    { canonical: 'Tata Consultancy Services', variants: ['TCS'], confidence: 0.6 }, // below 0.85
+  ], LLM_COMPANY_CONFIDENCE_THRESHOLD);
+
+  assert.equal(log[0].applied, false);
+  assert.equal(rows[0].company, 'TCS'); // untouched
+});
+
+test('applyLlmCompanyMerges: a merge that creates a new exact duplicate is caught by the reprocess re-run', () => {
+  const rows = buildRows([
+    { Year: '2023-24', Degree: '', Branch: 'CSE', Company: 'Tata Consultancy Services', Package: '4.5 LPA' },
+    { Year: '2023-24', Degree: '', Branch: 'CSE', Company: 'TCS', Package: '4.5 LPA' }, // becomes an exact duplicate once merged
+  ]);
+  applyLlmCompanyMerges(rows, [
+    { canonical: 'Tata Consultancy Services', variants: ['TCS'], confidence: 0.9 },
+  ], LLM_COMPANY_CONFIDENCE_THRESHOLD);
+
+  const { conflicts } = reprocessAfterLlmResolution(rows);
+  const included = rows.filter(r => !r.excluded);
+  const autoRemoved = rows.filter(r => r.excluded && r.removalBucket === 'auto');
+  assert.equal(included.length, 1, 'the merge-created duplicate must be caught, not silently double-counted');
+  assert.equal(autoRemoved.length, 1);
+  assert.equal(conflicts.length, 0);
+});
+
+test('applyLlmCompanyMerges: a merge with an empty variants array is never applied', () => {
+  const rows = buildRows([{ Year: '2023-24', Degree: '', Branch: 'CSE', Company: 'TCS', Package: '4.5 LPA' }]);
+  const log = applyLlmCompanyMerges(rows, [
+    { canonical: 'Tata Consultancy Services', variants: [], confidence: 0.99 },
+  ], LLM_COMPANY_CONFIDENCE_THRESHOLD);
+  assert.equal(log[0].applied, false);
+  assert.equal(rows[0].company, 'TCS');
 });

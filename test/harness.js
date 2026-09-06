@@ -15,6 +15,8 @@ const EXPORT_NAMES = [
   'computeDashboardData',
   // Phase 3 slice 1 — LLM-assisted branch/degree resolution
   'reprocessAfterLlmResolution', 'applyLlmBranchResolutions', 'LLM_BRANCH_CONFIDENCE_THRESHOLD',
+  // Phase 3 slice 2 — LLM-assisted company near-duplicate clustering
+  'applyLlmCompanyMerges', 'LLM_COMPANY_CONFIDENCE_THRESHOLD',
   'YEAR_PATTERNS', 'BRANCH_PATTERNS', 'COMPANY_PATTERNS', 'PACKAGE_PATTERNS', 'DEGREE_PATTERNS',
   'BRANCH_CANONICAL_LIST', 'DEGREE_ONLY_CODES', 'DEGREE_WITH_SPECIALIZATION_CODES',
   // Alumni path (Path B) — no single entry-point function exists for this path (the

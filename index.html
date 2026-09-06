@@ -241,6 +241,11 @@
           <span id="tryAiStatus" style="font-size:12.5px; color:var(--muted);"></span>
         </div>
         <ul id="tryAiDetail" style="margin:8px 0 0 0; padding:0; list-style:none;"></ul>
+        <div class="btn-row" style="margin-top:8px;">
+          <button class="btn secondary" id="tryAiCompanyBtn" style="display:none;">Try AI company matching</button>
+          <span id="tryAiCompanyStatus" style="font-size:12.5px; color:var(--muted);"></span>
+        </div>
+        <ul id="tryAiCompanyDetail" style="margin:8px 0 0 0; padding:0; list-style:none;"></ul>
       </div>
       </div>
 
@@ -367,6 +372,11 @@
           <span id="tryAiStatus2" style="font-size:12.5px; color:var(--muted);"></span>
         </div>
         <ul id="tryAiDetail2" style="margin:8px 0 0 0; padding:0; list-style:none;"></ul>
+        <div class="btn-row" style="margin-top:8px;">
+          <button class="btn secondary" id="tryAiCompanyBtn2" style="display:none;">Try AI company matching</button>
+          <span id="tryAiCompanyStatus2" style="font-size:12.5px; color:var(--muted);"></span>
+        </div>
+        <ul id="tryAiCompanyDetail2" style="margin:8px 0 0 0; padding:0; list-style:none;"></ul>
       </div>
     </section>
 
@@ -460,6 +470,7 @@ const ISSUE_CATALOG = {
   branch_code_expanded: {sev:'medium', text:'Branch recorded as an abbreviated code', detail:'The branch was recorded as a short department code (e.g. "Comp", "ECE", "Instru") rather than its full name, and was expanded.'},
   branch_unnormalized_degree: {sev:'medium', text:'Program has no canonical specialization list yet', detail:'This degree (e.g. MBA, M.Tech) carries a specialization/branch, but there is no dictionary of canonical names for it the way B.Tech has. The value was generically cleaned (whitespace/case) but not standardized against a known list.'},
   llm_resolved_branch: {sev:'medium', text:'Branch/degree resolved with AI assistance', detail:'This row’s branch/degree value did not match any known dictionary or pattern, so it was sent to an LLM for classification (only when the user explicitly clicked "Try AI resolution"). The model’s answer was accepted because its confidence met the threshold — see the LLM_Resolved sheet for the exact confidence score and every value that was attempted, including ones below the threshold that were left for manual review.'},
+  llm_resolved_company: {sev:'medium', text:'Company name merged with AI assistance', detail:'This company name looked different enough from another entry (e.g. an abbreviation vs. a full legal name) that the generic clustering pass did not merge them automatically. An LLM proposed the merge (only when the user explicitly clicked "Try AI company matching") and it was accepted because its confidence met the stricter threshold used for company merges — see the LLM_Company_Merges sheet for the exact confidence and every group that was attempted, including ones below the threshold that were left unmerged.'},
   // MINOR — cosmetic
   whitespace_trimmed:   {sev:'minor',  text:'Leading, trailing, or repeated whitespace', detail:'Extra spaces around or inside a value were trimmed.'},
   nbsp_fixed:           {sev:'minor',  text:'Non-breaking space or invisible character', detail:'A non-breaking space (invisible in Excel) was found inside a value and replaced with a normal space.'},
@@ -874,7 +885,7 @@ document.querySelectorAll('#stepNav li').forEach(li=>{
 let step1Done=false, step2Done=false;
 let rawHeaders=[], rawRows=[], rawSheetNames=null, rawSheetHeaders=null;
 let allRows1=[], rawSheetNamesFull1=[], rawSheetHeadersFull1=[]; // unfiltered, for the sheet-picker to re-slice
-let processedRows=[], companyAudit=[], packageConflicts=[], duplicateExamples=[], llmResolutionsLog=[];
+let processedRows=[], companyAudit=[], packageConflicts=[], duplicateExamples=[], llmResolutionsLog=[], llmCompanyMergeLog=[];
 
 /* Decide how to handle a multi-sheet upload: if every sheet name looks like a year, treat it as
    one-tab-per-year (existing behaviour). Otherwise the sheets are probably different SECTIONS of
@@ -1016,6 +1027,10 @@ function runCleaningPipeline(headers, rows, sheetNames, sheetHeaders, mapping){
 
 /* ---------------- Phase 3, slice 1: LLM-assisted branch/degree resolution ---------------- */
 const LLM_BRANCH_CONFIDENCE_THRESHOLD = 0.7;
+/* Slice 2 (company merging) uses a stricter threshold than slice 1: a wrong branch
+   classification just leaves a row in manual review (safe); a wrong company merge
+   actively corrupts good data by force-combining two different real companies. */
+const LLM_COMPANY_CONFIDENCE_THRESHOLD = 0.85;
 
 /* Re-runs the parts of the pipeline that operate on the full row set from scratch
    (company clustering, duplicate detection, package conflicts) after LLM resolution
@@ -1061,7 +1076,7 @@ function applyLlmBranchResolutions(rows, resolutions, threshold){
   return log;
 }
 
-async function runLlmBranchResolution(rows, aiEligible, headerIssueCount, ids, llmLog, onContinue){
+async function runLlmBranchResolution(rows, aiEligible, headerIssueCount, ids, llmLog, llmCompanyLog, onContinue){
   const btn = document.getElementById(ids.tryAiBtn), status = document.getElementById(ids.tryAiStatus);
   const values = [...new Set(aiEligible.map(r=>r.rawBranch))];
   btn.disabled = true;
@@ -1079,10 +1094,58 @@ async function runLlmBranchResolution(rows, aiEligible, headerIssueCount, ids, l
     llmLog.push(...newLogEntries);
     const { audit, conflicts } = reprocessAfterLlmResolution(rows);
     const appliedCount = newLogEntries.filter(l=>l.applied).length;
-    renderStepResults(rows, headerIssueCount, ids, audit, conflicts, onContinue, llmLog);
+    renderStepResults(rows, headerIssueCount, ids, audit, conflicts, onContinue, llmLog, llmCompanyLog);
     document.getElementById(ids.tryAiStatus).textContent = `Resolved ${appliedCount} of ${newLogEntries.length} via AI — see the LLM_Resolved sheet in the downloaded workbook for details.`;
   } catch(e){
     status.textContent = 'AI resolution failed: ' + e.message;
+    btn.disabled = false;
+  }
+}
+
+/* Applies company-merge groups to the matching rows in place. Stricter threshold than
+   branch resolution (see LLM_COMPANY_CONFIDENCE_THRESHOLD) since a wrong merge corrupts
+   data rather than just leaving a row in review. A row is only ever tagged once even if
+   (in principle) more than one group could touch it. */
+function applyLlmCompanyMerges(rows, groups, threshold){
+  const log = [];
+  groups.forEach(g=>{
+    const applied = !!(g.confidence>=threshold && g.canonical && Array.isArray(g.variants) && g.variants.length);
+    log.push({ canonical: g.canonical, variants: g.variants||[], confidence: g.confidence, applied });
+    if (!applied) return;
+    const variantSet = new Set(g.variants);
+    rows.forEach(r=>{
+      if (r.excluded || !variantSet.has(r.company)) return;
+      r.company = g.canonical;
+      if (!r.medium.includes('llm_resolved_company')) r.medium.push('llm_resolved_company');
+    });
+  });
+  return log;
+}
+
+async function runLlmCompanyMerge(rows, headerIssueCount, ids, llmLog, llmCompanyLog, onContinue){
+  const btn = document.getElementById(ids.tryAiCompanyBtn), status = document.getElementById(ids.tryAiCompanyStatus);
+  const values = [...new Set(rows.filter(r=>!r.excluded).map(r=>r.company))];
+  btn.disabled = true;
+  status.innerHTML = `<span class="spinner"></span>Checking ${values.length} distinct companies with AI…`;
+  try{
+    const resp = await fetch('/api/llm-resolve', {
+      method:'POST', headers:{'Content-Type':'application/json'},
+      body: JSON.stringify({ kind:'company', payload:{ values } })
+    });
+    const data = await resp.json().catch(()=>({}));
+    if (resp.status===501){ status.textContent = data.error || 'AI resolution isn’t configured yet.'; btn.disabled=false; return; }
+    if (!resp.ok){ status.textContent = 'AI matching failed: ' + (data.error||`HTTP ${resp.status}`); btn.disabled=false; return; }
+
+    const newLogEntries = applyLlmCompanyMerges(rows, data.groups||[], LLM_COMPANY_CONFIDENCE_THRESHOLD);
+    llmCompanyLog.push(...newLogEntries);
+    const { audit, conflicts } = reprocessAfterLlmResolution(rows);
+    const appliedCount = newLogEntries.filter(l=>l.applied).length;
+    renderStepResults(rows, headerIssueCount, ids, audit, conflicts, onContinue, llmLog, llmCompanyLog);
+    document.getElementById(ids.tryAiCompanyStatus).textContent = newLogEntries.length
+      ? `Merged ${appliedCount} of ${newLogEntries.length} proposed group${newLogEntries.length===1?'':'s'} via AI — see the LLM_Company_Merges sheet for details.`
+      : `No near-duplicate companies found by AI.`;
+  } catch(e){
+    status.textContent = 'AI matching failed: ' + e.message;
     btn.disabled = false;
   }
 }
@@ -1104,19 +1167,23 @@ document.getElementById('analyzeBtn').addEventListener('click', ()=>{
   packageConflicts = result.conflicts;
   processedRows = result.rows;
   llmResolutionsLog = [];
-  renderStepResults(result.rows, result.headerIssueCount, STEP1_IDS, companyAudit, packageConflicts, ()=> setStepActive(2), llmResolutionsLog);
+  llmCompanyMergeLog = [];
+  renderStepResults(result.rows, result.headerIssueCount, STEP1_IDS, companyAudit, packageConflicts, ()=> setStepActive(2), llmResolutionsLog, llmCompanyMergeLog);
   step1Done=true;
 });
 
 const STEP1_IDS = {statRow:'statRow1', insight:'insight1', resultsCard:'resultsCard', issuesCard:'issuesCard', issuesReport:'issuesReport',
   previewCard:'previewCard', previewBody:'previewBody', downloadReviewBtn:'downloadReviewBtn', downloadWorkbookBtn:'downloadWorkbookBtn', continueBtn:'toStep2Btn',
-  tryAiBtn:'tryAiBtn', tryAiStatus:'tryAiStatus', tryAiDetail:'tryAiDetail'};
+  tryAiBtn:'tryAiBtn', tryAiStatus:'tryAiStatus', tryAiDetail:'tryAiDetail',
+  tryAiCompanyBtn:'tryAiCompanyBtn', tryAiCompanyStatus:'tryAiCompanyStatus', tryAiCompanyDetail:'tryAiCompanyDetail'};
 const STEP2_IDS = {statRow:'statRow2', insight:'insight2', resultsCard:'resultsCard2', issuesCard:'issuesCard2', issuesReport:'issuesReport2',
   previewCard:'previewCard2', previewBody:'previewBody2', downloadReviewBtn:'downloadReviewBtn2', downloadWorkbookBtn:'downloadWorkbookBtn2', continueBtn:'generateBtn',
-  tryAiBtn:'tryAiBtn2', tryAiStatus:'tryAiStatus2', tryAiDetail:'tryAiDetail2'};
+  tryAiBtn:'tryAiBtn2', tryAiStatus:'tryAiStatus2', tryAiDetail:'tryAiDetail2',
+  tryAiCompanyBtn:'tryAiCompanyBtn2', tryAiCompanyStatus:'tryAiCompanyStatus2', tryAiCompanyDetail:'tryAiCompanyDetail2'};
 
-function renderStepResults(rows, headerIssueCount, ids, audit, conflicts, onContinue, llmLog){
+function renderStepResults(rows, headerIssueCount, ids, audit, conflicts, onContinue, llmLog, llmCompanyLog){
   llmLog = llmLog || [];
+  llmCompanyLog = llmCompanyLog || [];
   const needsReview = rows.filter(r=>r.excluded && r.removalBucket==='review');
   const autoRemoved = rows.filter(r=>r.excluded && r.removalBucket==='auto');
   const included = rows.filter(r=>!r.excluded);
@@ -1158,7 +1225,7 @@ function renderStepResults(rows, headerIssueCount, ids, audit, conflicts, onCont
     const blob = new Blob([csv], {type:'text/csv'});
     const a = document.createElement('a'); a.href=URL.createObjectURL(blob); a.download='review_file.csv'; a.click();
   };
-  document.getElementById(ids.downloadWorkbookBtn).onclick = ()=> buildAndDownloadWorkbook(included, needsReview, autoRemoved, audit, conflicts, llmLog);
+  document.getElementById(ids.downloadWorkbookBtn).onclick = ()=> buildAndDownloadWorkbook(included, needsReview, autoRemoved, audit, conflicts, llmLog, llmCompanyLog);
   document.getElementById(ids.continueBtn).onclick = onContinue;
 
   const aiEligible = needsReview.filter(r=>r.major.includes('unrecognized_branch')||r.major.includes('unrecognized_degree'));
@@ -1167,12 +1234,25 @@ function renderStepResults(rows, headerIssueCount, ids, audit, conflicts, onCont
     tryAiBtn.style.display = 'inline-block';
     tryAiBtn.disabled = false;
     tryAiBtn.textContent = `Try AI resolution (${aiEligible.length} row${aiEligible.length===1?'':'s'})`;
-    tryAiBtn.onclick = ()=> runLlmBranchResolution(rows, aiEligible, headerIssueCount, ids, llmLog, onContinue);
+    tryAiBtn.onclick = ()=> runLlmBranchResolution(rows, aiEligible, headerIssueCount, ids, llmLog, llmCompanyLog, onContinue);
   } else {
     tryAiBtn.style.display = 'none';
     document.getElementById(ids.tryAiStatus).textContent = '';
   }
   renderLlmDetail(ids, llmLog);
+
+  const distinctCompanies = [...new Set(included.map(r=>r.company))];
+  const tryAiCompanyBtn = document.getElementById(ids.tryAiCompanyBtn);
+  if (distinctCompanies.length>=2){
+    tryAiCompanyBtn.style.display = 'inline-block';
+    tryAiCompanyBtn.disabled = false;
+    tryAiCompanyBtn.textContent = `Try AI company matching (${distinctCompanies.length} companies)`;
+    tryAiCompanyBtn.onclick = ()=> runLlmCompanyMerge(rows, headerIssueCount, ids, llmLog, llmCompanyLog, onContinue);
+  } else {
+    tryAiCompanyBtn.style.display = 'none';
+    document.getElementById(ids.tryAiCompanyStatus).textContent = '';
+  }
+  renderLlmCompanyDetail(ids, llmCompanyLog);
 }
 
 /* Renders exactly what happened for every value the AI was asked to resolve — never
@@ -1189,6 +1269,22 @@ function renderLlmDetail(ids, llmLog){
       ? `<span class="badge badge-ok">Applied</span>`
       : `<span class="badge badge-manual">Not applied — still needs manual review</span>`;
     return `<li class="note" style="margin-bottom:4px;"><b>"${String(l.input).replace(/</g,'&lt;')}"</b> → ${resolvedText} (${pct}% confidence) ${badge}</li>`;
+  }).join('');
+}
+
+/* Same always-visible, never-just-a-count philosophy as renderLlmDetail, for company
+   merge groups instead of single-value resolutions — different shape (a group has
+   multiple variants folding into one canonical name), hence a separate renderer. */
+function renderLlmCompanyDetail(ids, llmCompanyLog){
+  const el = document.getElementById(ids.tryAiCompanyDetail);
+  if (!llmCompanyLog || !llmCompanyLog.length){ el.innerHTML = ''; return; }
+  el.innerHTML = llmCompanyLog.map(l=>{
+    const pct = Math.round((l.confidence||0)*100);
+    const variantsText = (l.variants||[]).map(v=>`"${String(v).replace(/</g,'&lt;')}"`).join(', ');
+    const badge = l.applied
+      ? `<span class="badge badge-ok">Merged</span>`
+      : `<span class="badge badge-manual">Not merged — below confidence threshold</span>`;
+    return `<li class="note" style="margin-bottom:4px;">${variantsText} → <b>"${String(l.canonical).replace(/</g,'&lt;')}"</b> (${pct}% confidence) ${badge}</li>`;
   }).join('');
 }
 
@@ -1233,7 +1329,7 @@ function renderIssuesReport(rows, headerIssueCount, conflicts, containerId){
 }
 
 /* ---------------- clean workbook export (.xlsx) ---------------- */
-function buildAndDownloadWorkbook(included, needsReview, autoRemoved, audit, conflicts, llmLog){
+function buildAndDownloadWorkbook(included, needsReview, autoRemoved, audit, conflicts, llmLog, llmCompanyLog){
   const wb = XLSX.utils.book_new();
   const years = [...new Set(included.map(r=>r.year))].sort();
   // distinct (degree, branch) pairs — this is the real grouping key now, not branch alone,
@@ -1323,6 +1419,17 @@ function buildAndDownloadWorkbook(included, needsReview, autoRemoved, audit, con
       llmLog.map(l=>[l.input, l.degree??'', l.branch??'', l.confidence, l.applied?'Yes':'No (below confidence threshold)'])
     );
     XLSX.utils.book_append_sheet(wb, XLSX.utils.aoa_to_sheet(llmAoa), 'LLM_Resolved');
+  }
+
+  // LLM_Company_Merges — every AI-proposed company merge group, applied or not (below
+  // the stricter 0.85 threshold), same audit-trail-first philosophy as LLM_Resolved.
+  // A separate sheet rather than reusing LLM_Resolved: the shapes genuinely differ (a
+  // group of variants merging into one canonical name, not a single-value resolution).
+  if (llmCompanyLog && llmCompanyLog.length){
+    const llmCoAoa = [['Variant(s)','Merged Into','Confidence','Applied?']].concat(
+      llmCompanyLog.map(l=>[(l.variants||[]).join(' / '), l.canonical??'', l.confidence, l.applied?'Yes':'No (below confidence threshold)'])
+    );
+    XLSX.utils.book_append_sheet(wb, XLSX.utils.aoa_to_sheet(llmCoAoa), 'LLM_Company_Merges');
   }
 
   XLSX.writeFile(wb, 'Placement_Data_Clean.xlsx');
@@ -1565,7 +1672,7 @@ file2.addEventListener('change', ()=>{ if (file2.files[0]) handleFile2(file2.fil
 
 let rawHeaders2=[], rawRows2=[], rawSheetNames2=null, rawSheetHeaders2=null;
 let allRows2=[], rawSheetNamesFull2=[], rawSheetHeadersFull2=[];
-let companyAudit2=[], packageConflicts2=[], processedRows2=[], llmResolutionsLog2=[];
+let companyAudit2=[], packageConflicts2=[], processedRows2=[], llmResolutionsLog2=[], llmCompanyMergeLog2=[];
 function handleFile2(file){
   document.getElementById('file2chip').innerHTML = `<div class="file-chip">${file.name}</div>`;
   readFile(file, (headers, rows, sheetNames, sheetHeaders)=>{
@@ -1632,11 +1739,12 @@ document.getElementById('analyzeBtn2').addEventListener('click', ()=>{
   packageConflicts2 = result.conflicts;
   processedRows2 = result.rows;
   llmResolutionsLog2 = [];
+  llmCompanyMergeLog2 = [];
   renderStepResults(result.rows, result.headerIssueCount, STEP2_IDS, companyAudit2, packageConflicts2, ()=>{
     step2Done=true;
     buildDashboard(processedRows2.filter(r=>!r.excluded));
     setStepActive(3);
-  }, llmResolutionsLog2);
+  }, llmResolutionsLog2, llmCompanyMergeLog2);
 });
 
 /* ---------------- STEP 3: aggregation + dashboard (adapted from sample) ---------------- */
