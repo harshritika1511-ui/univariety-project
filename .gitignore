@@ -1,0 +1,13 @@
+# Real source data — not committed (size + it's real student placement data, not a
+# fixture). If it ever changes, regenerate test/fixtures/task_a_dataset.json from a
+# local copy via test/fixtures/generate_fixture.py before it's gone from disk.
+Task_A_Raw_Placement_Data_5_Years.xlsx
+
+# Generated workbook output from the tool itself (default download filenames) —
+# regeneratable from source data, not something to track.
+Placement_Data_Clean.xlsx
+Placement_Data_Clean_*.xlsx
+Alumni_Influence_Top_Companies.xlsx
+
+# OS cruft
+.DS_Store

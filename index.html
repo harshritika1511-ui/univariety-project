@@ -199,6 +199,7 @@
                 <select id="mapSheet"></select>
               </div>
             </div>
+            <div class="map-field"><label>Degree column (optional)</label><select id="mapDegree"><option value="-1">— none, infer from Branch/Course —</option></select></div>
             <div class="map-field"><label>Course / branch column</label><select id="mapBranch"></select></div>
             <div class="map-field"><label>Company column</label><select id="mapCompany"></select></div>
             <div class="map-field"><label>Package column</label><select id="mapPackage"></select></div>
@@ -224,7 +225,7 @@
         <h2>Row-level preview</h2>
         <div class="scroll-table">
           <table>
-            <thead><tr><th>#</th><th>Year</th><th>Course</th><th>Company</th><th class="num">Package</th><th>Status</th><th>Notes</th></tr></thead>
+            <thead><tr><th>#</th><th>Year</th><th>Degree</th><th>Course</th><th>Company</th><th class="num">Package</th><th>Status</th><th>Notes</th></tr></thead>
             <tbody id="previewBody"></tbody>
           </table>
         </div>
@@ -319,6 +320,7 @@
                 <select id="mapSheet2"></select>
               </div>
             </div>
+            <div class="map-field"><label>Degree column (optional)</label><select id="mapDegree2"><option value="-1">— none, infer from Branch/Course —</option></select></div>
             <div class="map-field"><label>Course / branch column</label><select id="mapBranch2"></select></div>
             <div class="map-field"><label>Company column</label><select id="mapCompany2"></select></div>
             <div class="map-field"><label>Package column</label><select id="mapPackage2"></select></div>
@@ -344,7 +346,7 @@
         <h2>Row-level preview</h2>
         <div class="scroll-table">
           <table>
-            <thead><tr><th>#</th><th>Year</th><th>Course</th><th>Company</th><th class="num">Package</th><th>Status</th><th>Notes</th></tr></thead>
+            <thead><tr><th>#</th><th>Year</th><th>Degree</th><th>Course</th><th>Company</th><th class="num">Package</th><th>Status</th><th>Notes</th></tr></thead>
             <tbody id="previewBody2"></tbody>
           </table>
         </div>
@@ -365,6 +367,7 @@
       <div class="db-insight" id="dbInsightLine"></div>
       <div class="db-stat-row" id="dbStatRow"></div>
       <div class="card" style="border:none; box-shadow:none; padding:0; background:transparent;">
+        <div class="chip-list" id="degreeChips" style="margin-bottom:10px; display:none;"></div>
         <div class="chip-list" id="yearChips" style="margin-bottom:10px;"></div>
         <div class="chip-list" id="branchChips"></div>
       </div>
@@ -388,6 +391,14 @@ const YEAR_PATTERNS=['year','academicyear','batchyear','placementyear','passingy
 const BRANCH_PATTERNS=['branch','course','department','dept','stream','program','programme'];
 const COMPANY_PATTERNS=['company','companyname','recruiter','employer','organization','organisation'];
 const PACKAGE_PATTERNS=['packagelpa','package','ctclpa','ctc','salary','lpa','annualpackage'];
+// Deliberately does NOT include 'course'/'program'/'programme' — BRANCH_PATTERNS already claims
+// those header names for the branch/department column in this dataset's real sheets, so reusing
+// them here would make guessColumn collide between the Degree and Branch columns. Also avoid any
+// pattern that merely CONTAINS "program"/"course" as a substring (e.g. "programtype") — guessColumn's
+// fuzzy pass matches in both directions, so a bare "Program" header would still match a longer
+// pattern that happens to contain it (confirmed: this shipped as a real bug and was caught by
+// re-running the actual 5-year source file, not just synthetic data).
+const DEGREE_PATTERNS=['degree','degreename','qualification'];
 
 function parseYear(raw){
   if (raw===null||raw===undefined) return null;
@@ -421,9 +432,9 @@ function pickBestSheet(sheetNames, sheetHeaders){
 const ISSUE_CATALOG = {
   // MAJOR — correctness problems; row excluded or trust-affecting
   missing_field:        {sev:'major',  text:'Missing or unreadable required value', detail:'The year, course, company, or package was blank or unparseable, so the row was excluded from the clean dataset.'},
-  nonnumeric_package:   {sev:'major',  text:'Package value is not a number', detail:'The package column contained text that could not be read as a figure (after stripping an "LPA" unit label), so the row was excluded.'},
+  nonnumeric_package:   {sev:'major',  text:'Package value is not a number', detail:'The package column contained text that could not be read as a figure (after stripping any LPA/lakh/crore/rupee unit label), so the row was excluded.'},
   unrecognized_branch:  {sev:'major',  text:'Branch/course value did not match any known pattern', detail:'The value did not match any recognized branch code, full name, or naming-pattern variant used across the five years on file, so the row was excluded.'},
-  nonbtech_contam:      {sev:'major',  text:'Non-B.Tech record mixed into the data', detail:'A record tagged with a postgraduate program code (e.g. MCA) was found among what should be a B.Tech-only placement file, and was excluded.'},
+  unrecognized_degree:  {sev:'major',  text:'Degree value did not match any known degree', detail:'An explicit Degree column was provided, but its value did not match B.Tech, or any known branch-less or specialization-bearing degree, so the row was excluded pending a manual decision.'},
   multivalue_cell:      {sev:'major',  text:'Company field holds more than one value', detail:'The company cell contains a comma-separated combination of two values (e.g. two company names, or a name plus extra text) that cannot be safely split, so the row was excluded pending a manual decision.'},
   malformed_company_fixed:{sev:'major',text:'Company name field contained an embedded figure or system code', detail:'A package figure or an internal export code was concatenated directly into the company name text. This was corrected automatically, but the source record is worth a look.'},
   package_conflict:     {sev:'major',  text:'Conflicting package values for the same year + course + company', detail:'The same combination of year, course, and company shows two or more different package amounts on record. Some may be legitimate (different roles/tracks), but none of this is verifiable automatically — kept in the clean data but flagged.'},
@@ -435,10 +446,13 @@ const ISSUE_CATALOG = {
   acronym_paren_merged: {sev:'medium', text:'Company name duplicated as a bracketed acronym', detail:'The same company appeared once under its full name and again as a parenthetical acronym (e.g. "(HUL)"), and both were merged to the full name.'},
   branch_pattern_drift: {sev:'medium', text:'Branch naming pattern differs from other years', detail:'The branch/course label used a different formatting convention (prefix style, hyphen spacing, "&" vs "and", or a more verbose specialization label) than other years and was standardized to the common name.'},
   branch_code_expanded: {sev:'medium', text:'Branch recorded as an abbreviated code', detail:'The branch was recorded as a short department code (e.g. "Comp", "ECE", "Instru") rather than its full name, and was expanded.'},
+  branch_unnormalized_degree: {sev:'medium', text:'Program has no canonical specialization list yet', detail:'This degree (e.g. MBA, M.Tech) carries a specialization/branch, but there is no dictionary of canonical names for it the way B.Tech has. The value was generically cleaned (whitespace/case) but not standardized against a known list.'},
   // MINOR — cosmetic
   whitespace_trimmed:   {sev:'minor',  text:'Leading, trailing, or repeated whitespace', detail:'Extra spaces around or inside a value were trimmed.'},
   nbsp_fixed:           {sev:'minor',  text:'Non-breaking space or invisible character', detail:'A non-breaking space (invisible in Excel) was found inside a value and replaced with a normal space.'},
-  package_unit_text:    {sev:'minor',  text:'Package stored as text with a unit label', detail:'The package was written as text with "LPA" attached (e.g. "5.5 LPA") instead of a plain number, forcing a mixed-type column. The number was extracted.'},
+  package_unit_text:    {sev:'minor',  text:'Package stored as text with a unit label', detail:'The package was written as text with an "LPA" or "Lakh" label attached (e.g. "5.5 LPA") instead of a plain number, forcing a mixed-type column. The figure was extracted and converted to absolute rupees.'},
+  package_unit_crore_converted: {sev:'minor', text:'Package written in crore, converted to rupees', detail:'The package used "crore" (e.g. "1.2 crore") rather than LPA or absolute rupees. It was converted to its rupee value (1 crore = ₹1,00,00,000).'},
+  package_unit_assumed_rupees: {sev:'minor', text:'Package given as a bare number, assumed to already be in rupees', detail:'The package had no unit text and was a large figure (>=1000), so it was assumed to already be an absolute rupee value and used as-is. Verify this assumption if the figure looks wrong. (A small bare number is not flagged at all — that is the overwhelming norm for this kind of data, since LPA figures are almost always well under 1000.)'},
   header_inconsistency: {sev:'minor',  text:'Column headers differ across tabs', detail:'The uploaded file\u2019s sheets/tabs use different header names (or headers with trailing spaces) for the same field.'}
 };
 const SEV_ORDER = ['major','medium','minor'];
@@ -457,7 +471,6 @@ const BRANCH_CODE_MAP = {
   'civil':'Civil Engineering',
   'aids':'AI & Data Science','ai&ds':'AI & Data Science'
 };
-const BRANCH_EXCLUDE_CODES = new Set(['mca']);
 const BRANCH_FULLNAME_MAP = {
   'artificial intelligence & data science':'AI & Data Science',
   'chemical engineering':'Chemical Engineering',
@@ -487,7 +500,6 @@ function normalizeBranchFull(raw, major, medium){
   const usedPrefix = s !== s0.trim();
   if (!s) s = s0.trim();
   const lowerCode = s.toLowerCase();
-  if (BRANCH_EXCLUDE_CODES.has(lowerCode)) { major.push('nonbtech_contam'); return null; }
   if (BRANCH_CODE_MAP[lowerCode]) { medium.push('branch_code_expanded'); return BRANCH_CODE_MAP[lowerCode]; }
   const andAmp = s.replace(/\s+and\s+/gi,' & ').replace(/\s+/g,' ').trim();
   const lower = andAmp.toLowerCase();
@@ -500,6 +512,70 @@ function normalizeBranchFull(raw, major, medium){
     return BRANCH_FULLNAME_MAP[lower];
   }
   return undefined; // unrecognized
+}
+
+/* ===== DEGREE detection (this tool was originally B.Tech-only; a second/third degree in the
+   same file — MBA, MBBS, MCA, etc. — is now a supported case, not "contamination") ===== */
+const BTECH_DEGREE_CODES = new Set(['btech','be','bachelorofengineering','bacheloroftechnology']);
+// Branch-less degrees: the degree itself IS the program, so Branch = Degree name (no specialization dictionary needed).
+const DEGREE_ONLY_CODES = { mbbs:'MBBS', mca:'MCA', bds:'BDS', bpharm:'B.Pharm', mpharm:'M.Pharm' };
+// Degrees known to carry a specialization/branch, but with no canonical dictionary for it yet —
+// generically cleaned and flagged (branch_unnormalized_degree) rather than dictionary-normalized.
+const DEGREE_WITH_SPECIALIZATION_CODES = { mba:'MBA', mtech:'M.Tech', bba:'BBA' };
+const BRANCHLESS_DEGREE_NAMES = new Set(Object.values(DEGREE_ONLY_CODES));
+const SPECIALIZATION_STRIP_RE = /^[\s\-–:,()]+|[\s\-–:,()]+$/g;
+
+/* Resolves (degree, branch) for a row. Called from processRow2 in place of a direct
+   normalizeBranchFull() call, so the existing B.Tech-only dataset's behavior is unchanged
+   (B.Tech is always tried first / is the implicit default). */
+function detectDegreeAndBranch(degreeRaw, branchRaw, major, medium){
+  const hasDegreeCol = !!(degreeRaw && String(degreeRaw).trim());
+  const hasBranch = !!(branchRaw && String(branchRaw).trim());
+
+  if (hasDegreeCol){
+    const dn = norm(degreeRaw);
+    let explicitDegree = null;
+    if (BTECH_DEGREE_CODES.has(dn)) explicitDegree = 'B.Tech';
+    else if (DEGREE_ONLY_CODES[dn]) explicitDegree = DEGREE_ONLY_CODES[dn];
+    else if (DEGREE_WITH_SPECIALIZATION_CODES[dn]) explicitDegree = DEGREE_WITH_SPECIALIZATION_CODES[dn];
+    if (!explicitDegree) return { error:'unrecognized_degree' };
+
+    if (explicitDegree === 'B.Tech'){
+      if (!hasBranch) return { error:'missing' };
+      const b = normalizeBranchFull(branchRaw, major, medium);
+      if (!b) return { error:'unrecognized_branch' };
+      return { error:null, degree:'B.Tech', branch:b };
+    }
+    if (BRANCHLESS_DEGREE_NAMES.has(explicitDegree)){
+      return { error:null, degree:explicitDegree, branch: hasBranch ? String(branchRaw).trim() : explicitDegree };
+    }
+    // specialization-bearing degree (MBA/M.Tech/BBA) with an explicit Degree column
+    if (!hasBranch) return { error:null, degree:explicitDegree, branch:explicitDegree };
+    medium.push('branch_unnormalized_degree');
+    return { error:null, degree:explicitDegree, branch:String(branchRaw).trim() };
+  }
+
+  // no explicit Degree column — infer from the branch/course text alone
+  if (!hasBranch) return { error:'missing' };
+
+  const b = normalizeBranchFull(branchRaw, major, medium);
+  if (b) return { error:null, degree:'B.Tech', branch:b };
+
+  const dn = norm(branchRaw);
+  if (DEGREE_ONLY_CODES[dn]) return { error:null, degree:DEGREE_ONLY_CODES[dn], branch:DEGREE_ONLY_CODES[dn] };
+
+  for (const code in DEGREE_WITH_SPECIALIZATION_CODES){
+    const re = new RegExp('\\b'+code+'\\b','i');
+    if (re.test(branchRaw)){
+      const canonicalDegree = DEGREE_WITH_SPECIALIZATION_CODES[code];
+      let remainder = String(branchRaw).replace(re,'').replace(SPECIALIZATION_STRIP_RE,'').trim();
+      if (!remainder) remainder = canonicalDegree;
+      else medium.push('branch_unnormalized_degree');
+      return { error:null, degree:canonicalDegree, branch:remainder };
+    }
+  }
+
+  return { error:'unrecognized_branch' };
 }
 
 /* ===== COMPANY normalization (offer tags, acronyms, known typos, malformed entries) ===== */
@@ -551,17 +627,41 @@ function cleanWs(raw){
   const hadWs = collapsed !== s.replace(/^\s+|\s+$/g,'') || /\s{2,}/.test(s) || s !== s.trim();
   return {value:collapsed, hadNbsp, hadWs: collapsed !== String(raw==null?'':raw)};
 }
+/* ===== PACKAGE normalization — canonical unit is absolute rupees (4.5 LPA -> 450000) ===== */
+const RUPEES_PER_LAKH = 100000, RUPEES_PER_CRORE = 10000000;
+function parsePackageToRupees(raw){
+  let s = String(raw==null?'':raw).trim();
+  if (s==='') return { ok:false };
+  s = s.replace(/[₹,]/g,'').trim();
+
+  let unit = null;
+  if (/\b(crore|cr)\b/i.test(s)){ unit='crore'; s = s.replace(/\b(crore|cr)\b/ig,'').trim(); }
+  else if (/\b(lakh|lac)\b/i.test(s)){ unit='lakh'; s = s.replace(/\b(lakh|lac)\b/ig,'').trim(); }
+  else if (/\blpa\b/i.test(s)){ unit='lpa'; s = s.replace(/\blpa\b/ig,'').trim(); }
+  else if (/^\d+(\.\d+)?\s*l$/i.test(s)){ unit='lakh'; s = s.replace(/l$/i,'').trim(); }
+
+  const v = parseFloat(s);
+  if (s==='' || isNaN(v)) return { ok:false };
+
+  let rupees;
+  if (unit==='crore') rupees = v*RUPEES_PER_CRORE;
+  else if (unit==='lakh' || unit==='lpa') rupees = v*RUPEES_PER_LAKH;
+  else if (v<1000){ rupees = v*RUPEES_PER_LAKH; unit='bare_assumed_lpa'; }
+  else { rupees = v; unit='bare_assumed_rupees'; }
+
+  return { ok:true, rupees: Math.round(rupees), unit };
+}
 function processRow2(rec, idx){
   const major=[], medium=[], minor=[];
   let excluded=false, excludeReason=null, removalBucket=null;
 
   // ---- completely empty row ----
-  const allBlank = [rec.year, rec.branch, rec.company, rec.package].every(v => v===null || v===undefined || String(v).trim()==='');
+  const allBlank = [rec.year, rec.degree, rec.branch, rec.company, rec.package].every(v => v===null || v===undefined || String(v).trim()==='');
   if (allBlank){
     major.push('empty_row');
-    return { rowNum: idx+1, year:null, branch:null, company:null, package:null, major, medium, minor,
+    return { rowNum: idx+1, year:null, degree:null, branch:null, company:null, package:null, major, medium, minor,
              excluded:true, excludeReason:'Completely empty row', removalBucket:'auto',
-             rawYear: rec.year, rawBranch: rec.branch, rawCompany: rec.company, rawPackage: rec.package };
+             rawYear: rec.year, rawDegree: rec.degree, rawBranch: rec.branch, rawCompany: rec.company, rawPackage: rec.package };
   }
 
   // ---- year ----
@@ -569,18 +669,18 @@ function processRow2(rec, idx){
   const year = parseYear(yearRaw);
   if (year===null){ major.push('missing_field'); excluded=true; excludeReason='Year missing or unrecognized format'; removalBucket='review'; }
 
-  // ---- branch ----
+  // ---- degree + branch ----
   const brClean = cleanWs(rec.branch);
   if (brClean.hadWs) minor.push('whitespace_trimmed');
   if (brClean.hadNbsp) minor.push('nbsp_fixed');
-  let branch = null;
+  const degClean = cleanWs(rec.degree);
+  let degree = null, branch = null;
   if (!excluded){
-    if (!brClean.value){ major.push('missing_field'); excluded=true; excludeReason='Course/branch missing'; removalBucket='review'; }
-    else {
-      branch = normalizeBranchFull(brClean.value, major, medium);
-      if (branch === null){ excluded=true; excludeReason='Non-B.Tech program code (e.g. MCA) found in a B.Tech dataset'; removalBucket='review'; }
-      else if (branch === undefined){ major.push('unrecognized_branch'); excluded=true; excludeReason=`Unrecognized branch/course value: "${brClean.value}"`; removalBucket='review'; }
-    }
+    const resolved = detectDegreeAndBranch(degClean.value, brClean.value, major, medium);
+    if (resolved.error==='missing'){ major.push('missing_field'); excluded=true; excludeReason='Course/branch missing'; removalBucket='review'; }
+    else if (resolved.error==='unrecognized_degree'){ major.push('unrecognized_degree'); excluded=true; excludeReason=`Unrecognized degree value: "${degClean.value}"`; removalBucket='review'; }
+    else if (resolved.error==='unrecognized_branch'){ major.push('unrecognized_branch'); excluded=true; excludeReason=`Unrecognized branch/course value: "${brClean.value}"`; removalBucket='review'; }
+    else { degree = resolved.degree; branch = resolved.branch; }
   }
 
   // ---- company ----
@@ -612,19 +712,23 @@ function processRow2(rec, idx){
   let pkgValue = null;
   if (!excluded){
     const raw = rec.package;
-    let s = String(raw==null?'':raw).trim();
-    const hadUnit = /lpa/i.test(s);
-    s = s.replace(/[₹,]/g,'').replace(/lpa/ig,'').trim();
-    const v = parseFloat(s);
-    if (s==='' || isNaN(v)){ major.push('nonnumeric_package'); excluded=true; excludeReason=`Package value is not numeric: "${raw}"`; removalBucket='review'; }
+    const parsed = parsePackageToRupees(raw);
+    if (!parsed.ok){ major.push('nonnumeric_package'); excluded=true; excludeReason=`Package value is not numeric: "${raw}"`; removalBucket='review'; }
     else {
-      if (hadUnit) minor.push('package_unit_text');
-      pkgValue = +v.toFixed(2);
+      if (parsed.unit==='lpa' || parsed.unit==='lakh') minor.push('package_unit_text');
+      else if (parsed.unit==='crore') minor.push('package_unit_crore_converted');
+      // bare_assumed_lpa is deliberately NOT flagged: a plain number with no unit text is the
+      // overwhelming norm for this kind of data (confirmed empirically — 3,999 of 4,004 rows
+      // in the real 5-year source file hit this exact path), since LPA figures are almost
+      // always well under 1000. Flagging it would drown the issue report in near-100% noise
+      // for completely ordinary data. Only the much rarer large-bare-number case is flagged.
+      else if (parsed.unit==='bare_assumed_rupees') minor.push('package_unit_assumed_rupees');
+      pkgValue = parsed.rupees;
     }
   }
 
-  return { rowNum: idx+1, year, branch, company, package: pkgValue, major, medium, minor, excluded, excludeReason, removalBucket,
-            rawYear: yearRaw, rawBranch: rec.branch, rawCompany: rec.company, rawPackage: rec.package };
+  return { rowNum: idx+1, year, degree, branch, company, package: pkgValue, major, medium, minor, excluded, excludeReason, removalBucket,
+            rawYear: yearRaw, rawDegree: rec.degree, rawBranch: rec.branch, rawCompany: rec.company, rawPackage: rec.package };
 }
 
 /* stage 2: cluster remaining company spellings (case/whitespace/legal-suffix variants) */
@@ -662,12 +766,12 @@ function removeDuplicates(rows){
   const removedExamples = [];
   rows.forEach(r=>{
     if (r.excluded) return;
-    const key = `${r.year}|${r.branch}|${r.company}|${r.package}`;
+    const key = `${r.year}|${r.degree}|${r.branch}|${r.company}|${r.package}`;
     if (seen.has(key)){
       r.major.push('duplicate_row_removed');
       r.excluded = true;
       r.removalBucket = 'auto';
-      r.excludeReason = 'Exact duplicate of an earlier row (same year, branch, company, and package)';
+      r.excludeReason = 'Exact duplicate of an earlier row (same year, degree, branch, company, and package)';
       if (removedExamples.length<3) removedExamples.push(`${r.company} — ${r.branch}, ${r.year}`);
     } else {
       seen.add(key);
@@ -681,7 +785,7 @@ function flagPackageConflicts(rows){
   const groups = new Map();
   rows.forEach(r=>{
     if (r.excluded) return;
-    const k = `${r.year}|${r.branch}|${r.company}`;
+    const k = `${r.year}|${r.degree}|${r.branch}|${r.company}`;
     if (!groups.has(k)) groups.set(k, []);
     groups.get(k).push(r);
   });
@@ -689,8 +793,8 @@ function flagPackageConflicts(rows){
   groups.forEach((list, key)=>{
     const distinctPkgs = [...new Set(list.map(r=>r.package))];
     if (distinctPkgs.length>1){
-      const [year,branch,company] = key.split('|');
-      conflicts.push({year, branch, company, packages: distinctPkgs.sort((a,b)=>a-b), rows: list.length});
+      const [year,degree,branch,company] = key.split('|');
+      conflicts.push({year, degree, branch, company, packages: distinctPkgs.sort((a,b)=>a-b), rows: list.length});
       list.forEach(r=> r.major.push('package_conflict'));
     }
   });
@@ -824,6 +928,10 @@ function populateMapSelects(){
     sel.innerHTML = rawHeaders.map((h,i)=>`<option value="${i}">${h}</option>`).join('');
     if (guesses[id]>=0) sel.value=guesses[id];
   });
+  const degSel = document.getElementById('mapDegree');
+  const degGuess = guessColumn(rawHeaders, DEGREE_PATTERNS);
+  degSel.innerHTML = '<option value="-1">— none, infer from Branch/Course —</option>' + rawHeaders.map((h,i)=>`<option value="${i}">${h}</option>`).join('');
+  degSel.value = degGuess>=0 ? degGuess : -1;
 }
 document.getElementById('mapSheet').addEventListener('change', function(){
   const idx = +this.value;
@@ -835,7 +943,7 @@ document.getElementById('mapSheet').addEventListener('change', function(){
    so both stages apply the identical methodology: per-sheet column resolution, branch/company
    normalization, duplicate removal, empty-row removal, and package-conflict detection. */
 function runCleaningPipeline(headers, rows, sheetNames, sheetHeaders, mapping){
-  const {yh, bh, ch, ph, noYearCol, fromSheet, fixedYear} = mapping;
+  const {yh, dh, bh, ch, ph, noYearCol, fromSheet, fixedYear} = mapping;
 
   const sheetColumns = new Map();
   if (sheetNames && sheetHeaders){
@@ -844,10 +952,11 @@ function runCleaningPipeline(headers, rows, sheetNames, sheetHeaders, mapping){
       const hdrs = sheetHeaders[i] || [];
       const sameLayout = JSON.stringify([...hdrs].sort()) === refSet;
       if (sameLayout || !hdrs.length){
-        sheetColumns.set(name, {branch:bh, company:ch, package:ph, year:yh});
+        sheetColumns.set(name, {degree:dh, branch:bh, company:ch, package:ph, year:yh});
       } else {
-        const gy=guessColumn(hdrs, YEAR_PATTERNS), gb=guessColumn(hdrs, BRANCH_PATTERNS), gc=guessColumn(hdrs, COMPANY_PATTERNS), gp=guessColumn(hdrs, PACKAGE_PATTERNS);
+        const gy=guessColumn(hdrs, YEAR_PATTERNS), gd=guessColumn(hdrs, DEGREE_PATTERNS), gb=guessColumn(hdrs, BRANCH_PATTERNS), gc=guessColumn(hdrs, COMPANY_PATTERNS), gp=guessColumn(hdrs, PACKAGE_PATTERNS);
         sheetColumns.set(name, {
+          degree: gd>=0 ? hdrs[gd] : dh,
           branch: gb>=0 ? hdrs[gb] : bh,
           company: gc>=0 ? hdrs[gc] : ch,
           package: gp>=0 ? hdrs[gp] : ph,
@@ -856,11 +965,11 @@ function runCleaningPipeline(headers, rows, sheetNames, sheetHeaders, mapping){
       }
     });
   }
-  const colsFor = r => (r.__sheet && sheetColumns.get(r.__sheet)) || {branch:bh, company:ch, package:ph, year:yh};
+  const colsFor = r => (r.__sheet && sheetColumns.get(r.__sheet)) || {degree:dh, branch:bh, company:ch, package:ph, year:yh};
 
   const records = rows.map(r=>{
     const cols = colsFor(r);
-    return { year: fromSheet ? r.__sheet : (noYearCol ? fixedYear : r[cols.year]), branch:r[cols.branch], company:r[cols.company], package:r[cols.package] };
+    return { year: fromSheet ? r.__sheet : (noYearCol ? fixedYear : r[cols.year]), degree: cols.degree ? r[cols.degree] : undefined, branch:r[cols.branch], company:r[cols.company], package:r[cols.package] };
   });
 
   let processed = records.map((r,i)=>processRow2(r,i));
@@ -882,13 +991,14 @@ document.getElementById('analyzeBtn').addEventListener('click', ()=>{
   const fromSheet = document.getElementById('yearFromSheet').checked;
   const fixedYear = document.getElementById('mapYearFixed').value.trim();
   const yi=+document.getElementById('mapYear').value;
+  const di=+document.getElementById('mapDegree').value;
   const bi=+document.getElementById('mapBranch').value;
   const ci=+document.getElementById('mapCompany').value;
   const pi=+document.getElementById('mapPackage').value;
-  const yh=rawHeaders[yi], bh=rawHeaders[bi], ch=rawHeaders[ci], ph=rawHeaders[pi];
+  const yh=rawHeaders[yi], dh=di>=0?rawHeaders[di]:null, bh=rawHeaders[bi], ch=rawHeaders[ci], ph=rawHeaders[pi];
   if (noYearCol && !fromSheet && !fixedYear){ alert('Enter a year for this file (e.g. 2023-24) before checking for issues.'); return; }
 
-  const result = runCleaningPipeline(rawHeaders, rawRows, rawSheetNames, rawSheetHeaders, {yh,bh,ch,ph,noYearCol,fromSheet,fixedYear});
+  const result = runCleaningPipeline(rawHeaders, rawRows, rawSheetNames, rawSheetHeaders, {yh,dh,bh,ch,ph,noYearCol,fromSheet,fixedYear});
   companyAudit = result.audit;
   packageConflicts = result.conflicts;
   processedRows = result.rows;
@@ -933,13 +1043,13 @@ function renderStepResults(rows, headerIssueCount, ids, audit, conflicts, onCont
   document.getElementById(ids.issuesCard).style.display='block';
 
   document.getElementById(ids.previewBody).innerHTML = rows.slice(0,300).map(r=>`
-    <tr><td>${r.rowNum}</td><td>${r.year??r.rawYear??''}</td><td>${r.branch??r.rawBranch??''}</td><td>${r.company??r.rawCompany??''}</td><td class="num">${r.package===null||r.package===undefined?'—':r.package}</td><td>${badgeFor(r)}</td><td class="note">${rowNotes(r)}</td></tr>
+    <tr><td>${r.rowNum}</td><td>${r.year??r.rawYear??''}</td><td>${r.degree??r.rawDegree??''}</td><td>${r.branch??r.rawBranch??''}</td><td>${r.company??r.rawCompany??''}</td><td class="num">${r.package===null||r.package===undefined?'—':fmtPkg(r.package)}</td><td>${badgeFor(r)}</td><td class="note">${rowNotes(r)}</td></tr>
   `).join('');
   document.getElementById(ids.previewCard).style.display='block';
 
   document.getElementById(ids.downloadReviewBtn).onclick = ()=>{
     const statusOf = r => r.removalBucket==='auto' ? 'Removed (duplicate/empty)' : r.excluded ? 'Needs Manual Review' : (r.major.length?'Auto-fixed (major)':(r.medium.length||r.minor.length?'Auto-fixed':'OK'));
-    const csv = Papa.unparse(rows.map(r=>({ 'Row #':r.rowNum, Year:r.year??r.rawYear??'', Course:r.branch??r.rawBranch??'', Company:r.company??r.rawCompany??'', 'Package (LPA)':r.package, Status: statusOf(r), 'Issue Notes':rowNotes(r) })));
+    const csv = Papa.unparse(rows.map(r=>({ 'Row #':r.rowNum, Year:r.year??r.rawYear??'', Degree:r.degree??r.rawDegree??'', Course:r.branch??r.rawBranch??'', Company:r.company??r.rawCompany??'', 'Package (₹)':r.package, Status: statusOf(r), 'Issue Notes':rowNotes(r) })));
     const blob = new Blob([csv], {type:'text/csv'});
     const a = document.createElement('a'); a.href=URL.createObjectURL(blob); a.download='review_file.csv'; a.click();
   };
@@ -962,7 +1072,7 @@ function renderIssuesReport(rows, headerIssueCount, conflicts, containerId){
   });
   if (headerIssueCount) counts['header_inconsistency'] = {n:headerIssueCount, examples:[]};
   if (conflicts.length){
-    counts['package_conflict'] = {n:conflicts.length, examples:conflicts.slice(0,3).map(c=>`${c.company} — ${c.branch}, ${c.year}: ₹${c.packages.join(' / ₹')} LPA`)};
+    counts['package_conflict'] = {n:conflicts.length, examples:conflicts.slice(0,3).map(c=>`${c.company} — ${c.branch}, ${c.year}: ${c.packages.map(p=>fmtPkg(p)).join(' / ')}`)};
   }
 
   const html = SEV_ORDER.map(sev=>{
@@ -991,71 +1101,77 @@ function renderIssuesReport(rows, headerIssueCount, conflicts, containerId){
 function buildAndDownloadWorkbook(included, needsReview, autoRemoved, audit, conflicts){
   const wb = XLSX.utils.book_new();
   const years = [...new Set(included.map(r=>r.year))].sort();
-  const branches = [...new Set(included.map(r=>r.branch))].sort();
+  // distinct (degree, branch) pairs — this is the real grouping key now, not branch alone,
+  // since two different degrees can otherwise produce the same branch/specialization text.
+  const degreeBranchPairs = [...new Map(included.map(r=>[r.degree+'::'+r.branch,{degree:r.degree,branch:r.branch}])).values()]
+    .sort((a,b)=> a.degree<b.degree?-1:a.degree>b.degree?1:(a.branch<b.branch?-1:a.branch>b.branch?1:0));
 
-  // Clean_Data
-  const cdAoa = [['Year','Branch','Company','Package (LPA)']].concat(included.map(r=>[r.year, r.branch, r.company, r.package]));
+  // Clean_Data — columns: Year, Degree, Branch, Company, Package
+  const cdAoa = [['Year','Degree','Branch','Company','Package (₹)']].concat(included.map(r=>[r.year, r.degree, r.branch, r.company, r.package]));
   const wsClean = XLSX.utils.aoa_to_sheet(cdAoa);
   XLSX.utils.book_append_sheet(wb, wsClean, 'Clean_Data');
   const LAST = included.length + 1;
 
-  // Summary_By_Branch (with live formulas; distinct-count computed once)
+  // Summary_By_Branch (with live formulas; distinct-count computed once) — grouped by Year+Degree+Branch
   const branchDistinct = {};
-  included.forEach(r=>{ const k=r.year+'|'+r.branch; (branchDistinct[k] = branchDistinct[k]||new Set()).add(r.company); });
-  const sbHeader=['Year','Branch','Total Offers','Distinct Companies','Avg Package (LPA)','Min Package (LPA)','Max Package (LPA)'];
+  included.forEach(r=>{ const k=r.year+'|'+r.degree+'|'+r.branch; (branchDistinct[k] = branchDistinct[k]||new Set()).add(r.company); });
+  const sbHeader=['Year','Degree','Branch','Total Offers','Distinct Companies','Avg Package (₹)','Min Package (₹)','Max Package (₹)'];
   const wsBranch = XLSX.utils.aoa_to_sheet([sbHeader]);
   let r=2;
-  years.forEach(y=>branches.forEach(b=>{
-    XLSX.utils.sheet_add_aoa(wsBranch, [[y,b]], {origin:`A${r}`});
-    wsBranch[`C${r}`] = {t:'n', f:`COUNTIFS(Clean_Data!$A$2:$A$${LAST},A${r},Clean_Data!$B$2:$B$${LAST},B${r})`};
-    wsBranch[`D${r}`] = {t:'n', v:(branchDistinct[y+'|'+b]?branchDistinct[y+'|'+b].size:0)};
-    wsBranch[`E${r}`] = {t:'n', f:`IFERROR(ROUND(AVERAGEIFS(Clean_Data!$D$2:$D$${LAST},Clean_Data!$A$2:$A$${LAST},A${r},Clean_Data!$B$2:$B$${LAST},B${r}),2),"")`};
-    wsBranch[`F${r}`] = {t:'n', f:`IF(C${r}=0,"",MINIFS(Clean_Data!$D$2:$D$${LAST},Clean_Data!$A$2:$A$${LAST},A${r},Clean_Data!$B$2:$B$${LAST},B${r}))`};
-    wsBranch[`G${r}`] = {t:'n', f:`IF(C${r}=0,"",MAXIFS(Clean_Data!$D$2:$D$${LAST},Clean_Data!$A$2:$A$${LAST},A${r},Clean_Data!$B$2:$B$${LAST},B${r}))`};
+  years.forEach(y=>degreeBranchPairs.forEach(({degree:d,branch:b})=>{
+    XLSX.utils.sheet_add_aoa(wsBranch, [[y,d,b]], {origin:`A${r}`});
+    wsBranch[`D${r}`] = {t:'n', f:`COUNTIFS(Clean_Data!$A$2:$A$${LAST},A${r},Clean_Data!$B$2:$B$${LAST},B${r},Clean_Data!$C$2:$C$${LAST},C${r})`};
+    wsBranch[`E${r}`] = {t:'n', v:(branchDistinct[y+'|'+d+'|'+b]?branchDistinct[y+'|'+d+'|'+b].size:0)};
+    wsBranch[`F${r}`] = {t:'n', f:`IFERROR(ROUND(AVERAGEIFS(Clean_Data!$E$2:$E$${LAST},Clean_Data!$A$2:$A$${LAST},A${r},Clean_Data!$B$2:$B$${LAST},B${r},Clean_Data!$C$2:$C$${LAST},C${r}),0),"")`};
+    wsBranch[`G${r}`] = {t:'n', f:`IF(D${r}=0,"",MINIFS(Clean_Data!$E$2:$E$${LAST},Clean_Data!$A$2:$A$${LAST},A${r},Clean_Data!$B$2:$B$${LAST},B${r},Clean_Data!$C$2:$C$${LAST},C${r}))`};
+    wsBranch[`H${r}`] = {t:'n', f:`IF(D${r}=0,"",MAXIFS(Clean_Data!$E$2:$E$${LAST},Clean_Data!$A$2:$A$${LAST},A${r},Clean_Data!$B$2:$B$${LAST},B${r},Clean_Data!$C$2:$C$${LAST},C${r}))`};
     r++;
   }));
-  wsBranch['!ref'] = `A1:G${r-1}`;
+  wsBranch['!ref'] = `A1:H${r-1}`;
   XLSX.utils.book_append_sheet(wb, wsBranch, 'Summary_By_Branch');
 
-  // Summary_By_Company
+  // Summary_By_Company — companies are counted across degrees (a company is a company regardless
+  // of program), but "distinct programs recruited from" counts (degree,branch) pairs, not raw
+  // branch text, so an MBA "Finance" specialization never gets conflated with a same-named one
+  // under another degree.
   const comboCounts = {};
   included.forEach(rw=>{ const k=rw.year+'|'+rw.company; comboCounts[k]=(comboCounts[k]||0)+1; });
   const companyDistinct = {};
-  included.forEach(rw=>{ const k=rw.year+'|'+rw.company; (companyDistinct[k]=companyDistinct[k]||new Set()).add(rw.branch); });
+  included.forEach(rw=>{ const k=rw.year+'|'+rw.company; (companyDistinct[k]=companyDistinct[k]||new Set()).add(rw.degree+'::'+rw.branch); });
   const combos = Object.keys(comboCounts).map(k=>{ const [y,co]=k.split('|'); return {y,co,n:comboCounts[k]}; }).sort((a,b)=> a.y<b.y?-1:a.y>b.y?1:b.n-a.n);
-  const scHeader=['Year','Company','Total Offers','Distinct Branches','Avg Package (LPA)','Min Package (LPA)','Max Package (LPA)'];
+  const scHeader=['Year','Company','Total Offers','Distinct Programs','Avg Package (₹)','Min Package (₹)','Max Package (₹)'];
   const wsCo = XLSX.utils.aoa_to_sheet([scHeader]);
   r=2;
   combos.forEach(({y,co})=>{
     XLSX.utils.sheet_add_aoa(wsCo, [[y,co]], {origin:`A${r}`});
-    wsCo[`C${r}`] = {t:'n', f:`COUNTIFS(Clean_Data!$A$2:$A$${LAST},A${r},Clean_Data!$C$2:$C$${LAST},B${r})`};
+    wsCo[`C${r}`] = {t:'n', f:`COUNTIFS(Clean_Data!$A$2:$A$${LAST},A${r},Clean_Data!$D$2:$D$${LAST},B${r})`};
     wsCo[`D${r}`] = {t:'n', v:(companyDistinct[y+'|'+co]?companyDistinct[y+'|'+co].size:0)};
-    wsCo[`E${r}`] = {t:'n', f:`IFERROR(ROUND(AVERAGEIFS(Clean_Data!$D$2:$D$${LAST},Clean_Data!$A$2:$A$${LAST},A${r},Clean_Data!$C$2:$C$${LAST},B${r}),2),"")`};
-    wsCo[`F${r}`] = {t:'n', f:`IF(C${r}=0,"",MINIFS(Clean_Data!$D$2:$D$${LAST},Clean_Data!$A$2:$A$${LAST},A${r},Clean_Data!$C$2:$C$${LAST},B${r}))`};
-    wsCo[`G${r}`] = {t:'n', f:`IF(C${r}=0,"",MAXIFS(Clean_Data!$D$2:$D$${LAST},Clean_Data!$A$2:$A$${LAST},A${r},Clean_Data!$C$2:$C$${LAST},B${r}))`};
+    wsCo[`E${r}`] = {t:'n', f:`IFERROR(ROUND(AVERAGEIFS(Clean_Data!$E$2:$E$${LAST},Clean_Data!$A$2:$A$${LAST},A${r},Clean_Data!$D$2:$D$${LAST},B${r}),0),"")`};
+    wsCo[`F${r}`] = {t:'n', f:`IF(C${r}=0,"",MINIFS(Clean_Data!$E$2:$E$${LAST},Clean_Data!$A$2:$A$${LAST},A${r},Clean_Data!$D$2:$D$${LAST},B${r}))`};
+    wsCo[`G${r}`] = {t:'n', f:`IF(C${r}=0,"",MAXIFS(Clean_Data!$E$2:$E$${LAST},Clean_Data!$A$2:$A$${LAST},A${r},Clean_Data!$D$2:$D$${LAST},B${r}))`};
     r++;
   });
   wsCo['!ref'] = `A1:G${r-1}`;
   XLSX.utils.book_append_sheet(wb, wsCo, 'Summary_By_Company');
 
   // Package_Conflicts
-  const pcAoa = [['Year','Branch','Company','Distinct Package Values (LPA)','Rows Involved']].concat(
-    conflicts.map(c=>[c.year, c.branch, c.company, c.packages.join(' / '), c.rows])
+  const pcAoa = [['Year','Degree','Branch','Company','Distinct Package Values (₹)','Rows Involved']].concat(
+    conflicts.map(c=>[c.year, c.degree, c.branch, c.company, c.packages.map(p=>'₹'+p.toLocaleString('en-IN')).join(' / '), c.rows])
   );
   XLSX.utils.book_append_sheet(wb, XLSX.utils.aoa_to_sheet(pcAoa), 'Package_Conflicts');
 
   // Needs_Manual_Review
-  const nmAoa = [['Year (raw)','Branch (raw)','Company (raw)','Package (raw)','Reason']].concat(
-    needsReview.map(r=>[r.rawYear??'', r.rawBranch??'', r.rawCompany??'', r.rawPackage??'', r.excludeReason||''])
+  const nmAoa = [['Year (raw)','Degree (raw)','Branch (raw)','Company (raw)','Package (raw)','Reason']].concat(
+    needsReview.map(r=>[r.rawYear??'', r.rawDegree??'', r.rawBranch??'', r.rawCompany??'', r.rawPackage??'', r.excludeReason||''])
   );
   XLSX.utils.book_append_sheet(wb, XLSX.utils.aoa_to_sheet(nmAoa), 'Needs_Manual_Review');
 
   // Rows_Removed (duplicates + empty rows — auto-removed, no review needed)
-  const rrAoa = [['Year (raw)','Branch (raw)','Company (raw)','Package (raw)','Reason','Method']].concat(
-    autoRemoved.map(r=>[r.rawYear??'', r.rawBranch??'', r.rawCompany??'', r.rawPackage??'', r.excludeReason||'',
+  const rrAoa = [['Year (raw)','Degree (raw)','Branch (raw)','Company (raw)','Package (raw)','Reason','Method']].concat(
+    autoRemoved.map(r=>[r.rawYear??'', r.rawDegree??'', r.rawBranch??'', r.rawCompany??'', r.rawPackage??'', r.excludeReason||'',
       r.excludeReason && r.excludeReason.startsWith('Exact duplicate')
-        ? 'Grouped by final Year+Branch+Company+Package; kept the first occurrence of each group, removed the rest.'
-        : 'All four fields (year, branch, company, package) were blank.'])
+        ? 'Grouped by final Year+Degree+Branch+Company+Package; kept the first occurrence of each group, removed the rest.'
+        : 'All fields (year, degree, branch, company, package) were blank.'])
   );
   XLSX.utils.book_append_sheet(wb, XLSX.utils.aoa_to_sheet(rrAoa), 'Rows_Removed');
 
@@ -1331,6 +1447,10 @@ function populateMapSelects2(){
     sel.innerHTML = rawHeaders2.map((h,i)=>`<option value="${i}">${h}</option>`).join('');
     if (guesses[id]>=0) sel.value=guesses[id];
   });
+  const degSel = document.getElementById('mapDegree2');
+  const degGuess = guessColumn(rawHeaders2, DEGREE_PATTERNS);
+  degSel.innerHTML = '<option value="-1">— none, infer from Branch/Course —</option>' + rawHeaders2.map((h,i)=>`<option value="${i}">${h}</option>`).join('');
+  degSel.value = degGuess>=0 ? degGuess : -1;
 }
 document.getElementById('mapSheet2').addEventListener('change', function(){
   const idx = +this.value;
@@ -1355,13 +1475,14 @@ document.getElementById('analyzeBtn2').addEventListener('click', ()=>{
   const fromSheet=document.getElementById('yearFromSheet2').checked;
   const fixedYear=document.getElementById('mapYearFixed2').value.trim();
   const yi=+document.getElementById('mapYear2').value;
+  const di=+document.getElementById('mapDegree2').value;
   const bi=+document.getElementById('mapBranch2').value;
   const ci=+document.getElementById('mapCompany2').value;
   const pi=+document.getElementById('mapPackage2').value;
-  const yh=rawHeaders2[yi], bh=rawHeaders2[bi], ch=rawHeaders2[ci], ph=rawHeaders2[pi];
+  const yh=rawHeaders2[yi], dh=di>=0?rawHeaders2[di]:null, bh=rawHeaders2[bi], ch=rawHeaders2[ci], ph=rawHeaders2[pi];
   if (noYearCol && !fromSheet && !fixedYear){ alert('Enter a year for this file (e.g. 2023-24) before checking for issues.'); return; }
 
-  const result = runCleaningPipeline(rawHeaders2, rawRows2, rawSheetNames2, rawSheetHeaders2, {yh,bh,ch,ph,noYearCol,fromSheet,fixedYear});
+  const result = runCleaningPipeline(rawHeaders2, rawRows2, rawSheetNames2, rawSheetHeaders2, {yh,dh,bh,ch,ph,noYearCol,fromSheet,fixedYear});
   companyAudit2 = result.audit;
   packageConflicts2 = result.conflicts;
   processedRows2 = result.rows;
@@ -1373,9 +1494,12 @@ document.getElementById('analyzeBtn2').addEventListener('click', ()=>{
 });
 
 /* ---------------- STEP 3: aggregation + dashboard (adapted from sample) ---------------- */
-function buildDashboard(rows){
-  const clean = rows.filter(r=>r.package!==null && r.year && r.branch && r.company);
-  const years = [...new Set(clean.map(r=>r.year))].sort();
+/* Computes one dashboard data bundle (grand totals, per-year/per-branch stats, leaderboards) for
+   a given row set. Called once for "All" degrees and once per individual degree, so switching
+   the Degree filter is just swapping which precomputed bundle window.DATA points at — the four
+   render functions below (renderAllAll/renderYearAll/renderAllBranch/renderYearBranch) are
+   untouched, since they only ever read from window.DATA. */
+function computeDashboardData(clean, years){
   const branches = [...new Set(clean.map(r=>r.branch))].sort();
 
   function agg(list){
@@ -1441,14 +1565,25 @@ function buildDashboard(rows){
     });
   });
 
-  window.DATA = { years, branches, yearTotals, branchTotals, yearBranch, grandTotal,
+  return { years, branches, yearTotals, branchTotals, yearBranch, grandTotal,
     topCompaniesOverall, topCompaniesByYear, topCompaniesByBranch, topCompaniesByYearBranch,
     topPayingOverall, topPayingByYear, topPayingByBranch, topPayingByYearBranch };
-  window.dbState = { year:'All', branch:'All' };
+}
+
+function buildDashboard(rows){
+  const clean = rows.filter(r=>r.package!==null && r.year && r.degree && r.branch && r.company);
+  const years = [...new Set(clean.map(r=>r.year))].sort();
+  const degrees = [...new Set(clean.map(r=>r.degree))].sort();
+
+  window.DATA_BY_DEGREE = { All: computeDashboardData(clean, years) };
+  degrees.forEach(d=> window.DATA_BY_DEGREE[d] = computeDashboardData(clean.filter(r=>r.degree===d), years));
+  window.ALL_DEGREES = degrees; // always the full list, regardless of which bundle is active
+  window.DATA = window.DATA_BY_DEGREE.All;
+  window.dbState = { year:'All', branch:'All', degree:'All' };
   renderDashboard();
 }
 
-function fmtPkg(v){ return v===null||v===undefined ? '—' : v.toFixed(2); }
+function fmtPkg(v){ return v===null||v===undefined ? '—' : '₹'+Math.round(v).toLocaleString('en-IN'); }
 function fmtInt(v){ return v===null||v===undefined ? '—' : v.toLocaleString('en-IN'); }
 function nOffers(n){ return fmtInt(n) + (n===1?' offer':' offers'); }
 function nCompanies(n){ return fmtInt(n) + (n===1?' company':' companies'); }
@@ -1483,6 +1618,14 @@ function renderActionItems(items){
 function makeChip(label, active, onClick){ const el=document.createElement('div'); el.className='chip'+(active?' active':''); el.textContent=label; el.onclick=onClick; return el; }
 function buildChips(){
   const DATA=window.DATA, state=window.dbState;
+  const degreeChips=document.getElementById('degreeChips'); degreeChips.innerHTML='';
+  if (window.ALL_DEGREES && window.ALL_DEGREES.length>1){
+    degreeChips.style.display='flex';
+    degreeChips.appendChild(makeChip('All', state.degree==='All', ()=>{ state.degree='All'; state.branch='All'; renderDashboard(); }));
+    window.ALL_DEGREES.forEach(d=> degreeChips.appendChild(makeChip(d, state.degree===d, ()=>{ state.degree=d; state.branch='All'; renderDashboard(); })));
+  } else {
+    degreeChips.style.display='none';
+  }
   const yearChips=document.getElementById('yearChips'); yearChips.innerHTML='';
   yearChips.appendChild(makeChip('All', state.year==='All', ()=>{ state.year='All'; renderDashboard(); }));
   DATA.years.forEach(y=> yearChips.appendChild(makeChip(y, state.year===y, ()=>{ state.year=y; renderDashboard(); })));
@@ -1490,9 +1633,10 @@ function buildChips(){
   branchChips.appendChild(makeChip('All', state.branch==='All', ()=>{ state.branch='All'; renderDashboard(); }));
   DATA.branches.forEach(b=> branchChips.appendChild(makeChip(b, state.branch===b, ()=>{ state.branch=b; renderDashboard(); })));
 }
-document.getElementById('resetBtn').onclick = ()=>{ window.dbState.year='All'; window.dbState.branch='All'; renderDashboard(); };
+document.getElementById('resetBtn').onclick = ()=>{ window.dbState.year='All'; window.dbState.branch='All'; window.dbState.degree='All'; renderDashboard(); };
 
 function renderDashboard(){
+  window.DATA = (window.DATA_BY_DEGREE && window.DATA_BY_DEGREE[window.dbState.degree]) || window.DATA_BY_DEGREE.All;
   const DATA=window.DATA, state=window.dbState;
   buildChips();
   const y=state.year, b=state.branch;
@@ -1508,7 +1652,7 @@ function renderDashboard(){
 
   if (y==='All' && b==='All'){
     stats=DATA.grandTotal; scopeTag=`${DATA.years[0]} – ${DATA.years[DATA.years.length-1]}`;
-    insight = `${nOffers(stats.offers)} across ${DATA.branches.length} courses and ${nCompanies(stats.companies)} over ${DATA.years.length} year${DATA.years.length===1?'':'s'}, averaging ₹${fmtPkg(stats.avg)} LPA per offer.`;
+    insight = `${nOffers(stats.offers)} across ${DATA.branches.length} courses and ${nCompanies(stats.companies)} over ${DATA.years.length} year${DATA.years.length===1?'':'s'}, averaging ${fmtPkg(stats.avg)} per offer.`;
     content.appendChild(renderAllAll());
   } else if (y!=='All' && b==='All'){
     stats=DATA.yearTotals[y]; scopeTag=`${stats.branches} courses active`;
@@ -1517,16 +1661,16 @@ function renderDashboard(){
       const prevY=DATA.years[idx-1], prevStats=DATA.yearTotals[prevY];
       const offD=pctDelta(stats.offers, prevStats.offers);
       insightCls = offD!==null && offD<-10 ? 'focus':'';
-      insight = `${y}: ${nOffers(stats.offers)} from ${nCompanies(stats.companies)}, avg ₹${fmtPkg(stats.avg)} LPA. Offers ${offD>=0?'up':'down'} ${Math.abs(offD).toFixed(1)}% vs ${prevY}.`;
+      insight = `${y}: ${nOffers(stats.offers)} from ${nCompanies(stats.companies)}, avg ${fmtPkg(stats.avg)}. Offers ${offD>=0?'up':'down'} ${Math.abs(offD).toFixed(1)}% vs ${prevY}.`;
     } else {
-      insight = `${y}: ${nOffers(stats.offers)} from ${nCompanies(stats.companies)} across ${stats.branches} courses, averaging ₹${fmtPkg(stats.avg)} LPA. First year in this dataset.`;
+      insight = `${y}: ${nOffers(stats.offers)} from ${nCompanies(stats.companies)} across ${stats.branches} courses, averaging ${fmtPkg(stats.avg)}. First year in this dataset.`;
     }
     content.appendChild(renderYearAll(y));
   } else if (y==='All' && b!=='All'){
     stats=DATA.branchTotals[b]; const c=classifyBranch(b);
     insightCls = c.cls==='focus'?'focus':(c.cls==='new'?'new':'');
     scopeTag = stats.yearsActive.length? `active ${stats.yearsActive[0]} – ${stats.yearsActive[stats.yearsActive.length-1]}` : '';
-    insight = `${b}: ${badgeHtml(c)} — ${c.detail}. ${nOffers(stats.offers)} total across its active years, averaging ₹${fmtPkg(stats.avg)} LPA (range ₹${fmtPkg(stats.min)}–₹${fmtPkg(stats.max)} LPA).`;
+    insight = `${b}: ${badgeHtml(c)} — ${c.detail}. ${nOffers(stats.offers)} total across its active years, averaging ${fmtPkg(stats.avg)} (range ${fmtPkg(stats.min)}–${fmtPkg(stats.max)}).`;
     content.appendChild(renderAllBranch(b));
   } else {
     stats=DATA.yearBranch[y][b]; scopeTag=`${b}`;
@@ -1540,7 +1684,7 @@ function renderDashboard(){
       } else { yoy = ` No offers recorded for ${b} in ${prevY}.`; insightCls='new'; }
     }
     if (stats.offers===0){ insight=`No offers recorded for ${b} in ${y}.`; insightCls='focus'; }
-    else { insight = `${b} in ${y}: ${nOffers(stats.offers)} from ${nCompanies(stats.companies)}, avg ₹${fmtPkg(stats.avg)} LPA (range ₹${fmtPkg(stats.min)}–₹${fmtPkg(stats.max)} LPA).${yoy}`; }
+    else { insight = `${b} in ${y}: ${nOffers(stats.offers)} from ${nCompanies(stats.companies)}, avg ${fmtPkg(stats.avg)} (range ${fmtPkg(stats.min)}–${fmtPkg(stats.max)}).${yoy}`; }
     content.appendChild(renderYearBranch(y,b));
   }
   document.getElementById('dbScopeTag').textContent=scopeTag;
@@ -1552,9 +1696,9 @@ function renderStatRow(stats){
   document.getElementById('dbStatRow').innerHTML = [
     ['Total Offers', fmtInt(stats.offers), ''],
     ['Companies', fmtInt(stats.companies===undefined?null:stats.companies), ''],
-    ['Avg Package', fmtPkg(stats.avg), 'LPA'],
-    ['Median Package', fmtPkg(stats.median), 'LPA'],
-    ['Min / Max', (stats.min===null?'—':fmtPkg(stats.min)+' / '+fmtPkg(stats.max)), 'LPA'],
+    ['Avg Package', fmtPkg(stats.avg), ''],
+    ['Median Package', fmtPkg(stats.median), ''],
+    ['Min / Max', (stats.min===null?'—':fmtPkg(stats.min)+' / '+fmtPkg(stats.max)), ''],
   ].map(([label,val,unit])=>`<div class="db-stat"><p class="stat-label">${label}</p><p class="stat-value">${val}${unit?`<span class="unit">${unit}</span>`:''}</p></div>`).join('');
 }
 function renderAllAll(){
@@ -1583,7 +1727,7 @@ function renderAllAll(){
   if (mostImproved && mostImproved.bt.yoyLatest.offersPct>2) bullets.push(`<li class="good"><b>${mostImproved.b}</b> improved the most: offers ${deltaSpan(mostImproved.bt.yoyLatest.offersPct)} from ${mostImproved.bt.yoyLatest.fromYear} to ${mostImproved.bt.yoyLatest.toYear}, avg package ${deltaSpan(mostImproved.bt.yoyLatest.pkgPct)} over the same period.</li>`);
   if (mostDeclined && mostDeclined.bt.yoyLatest.offersPct<-2 && mostDeclined.b!==(mostImproved&&mostImproved.b)) bullets.push(`<li class="bad"><b>${mostDeclined.b}</b> dipped the most: offers ${deltaSpan(mostDeclined.bt.yoyLatest.offersPct)} from ${mostDeclined.bt.yoyLatest.fromYear} to ${mostDeclined.bt.yoyLatest.toYear}.</li>`);
   if (topCo.length) bullets.push(`<li class="good"><b>${DATA.topCompaniesOverall[0].name}</b> hired the most overall — ${nOffers(DATA.topCompaniesOverall[0].offers)} across all years.</li>`);
-  if (topPay.length) bullets.push(`<li class="good">Highest average package overall: <b>${DATA.topPayingOverall[0].name}</b> at ₹${fmtPkg(DATA.topPayingOverall[0].avg)} LPA${DATA.topPayingOverall[0].offers===1?' (single offer — treat as an outlier, not a trend)':''}.</li>`);
+  if (topPay.length) bullets.push(`<li class="good">Highest average package overall: <b>${DATA.topPayingOverall[0].name}</b> at ${fmtPkg(DATA.topPayingOverall[0].avg)}${DATA.topPayingOverall[0].offers===1?' (single offer — treat as an outlier, not a trend)':''}.</li>`);
   if (needsFocus.length) bullets.push(`<li class="bad">Needs focus: ${needsFocus.map(x=>`<b>${x.b}</b> (${x.c.detail.toLowerCase()})`).join(', ')}.</li>`);
   if (discontinued.length) bullets.push(`<li class="flag">No offers in the most recent year despite prior activity: ${discontinued.map(x=>`<b>${x.b}</b> (last active ${x.bt.yearsActive[x.bt.yearsActive.length-1]})`).join(', ')}.</li>`);
   if (newBranches.length) bullets.push(`<li class="flag">New to the data: ${newBranches.map(x=>`<b>${x.b}</b> (first appeared ${x.bt.yearsActive[0]})`).join(', ')}.</li>`);
@@ -1648,7 +1792,7 @@ function renderYearAll(y){
   if (newThisYear.length) bullets.push(`<li class="flag">Had no offers in ${prevY} but recruited in ${y}: ${newThisYear.map(r=>`<b>${r.b}</b>`).join(', ')}.</li>`);
   if (droppedThisYear.length) bullets.push(`<li class="bad">Had offers in ${prevY} but none in ${y}: ${droppedThisYear.map(b=>`<b>${b}</b>`).join(', ')}.</li>`);
   if (topCo) bullets.push(`<li class="good">Most active recruiter: <b>${DATA.topCompaniesByYear[y][0].name}</b> — ${nOffers(DATA.topCompaniesByYear[y][0].offers)}.</li>`);
-  if (topPay) bullets.push(`<li class="good">Highest average package: <b>${DATA.topPayingByYear[y][0].name}</b> at ₹${fmtPkg(DATA.topPayingByYear[y][0].avg)} LPA${DATA.topPayingByYear[y][0].offers===1?' (single offer)':''}.</li>`);
+  if (topPay) bullets.push(`<li class="good">Highest average package: <b>${DATA.topPayingByYear[y][0].name}</b> at ${fmtPkg(DATA.topPayingByYear[y][0].avg)}${DATA.topPayingByYear[y][0].offers===1?' (single offer)':''}.</li>`);
   if (notOffered.length) bullets.push(`<li class="flag">No offers recorded this year: ${notOffered.map(b=>`<b>${b}</b>`).join(', ')}.</li>`);
 
   const actionItems = [];
@@ -1697,7 +1841,7 @@ function renderAllBranch(b){
   if (worstYear && active.length>1) bullets.push(`<li class="${worstYear.offers<bestYear.offers*0.5?'bad':''}">Lowest (active) year: <b>${worstYear.y}</b> with ${nOffers(worstYear.offers)}.</li>`);
   if (bt.yoyLatest) bullets.push(`<li class="${bt.yoyLatest.offersPct<-2?'bad':bt.yoyLatest.offersPct>2?'good':''}">Latest YoY (${bt.yoyLatest.fromYear} → ${bt.yoyLatest.toYear}): offers ${deltaSpan(bt.yoyLatest.offersPct)}, avg package ${deltaSpan(bt.yoyLatest.pkgPct)}.</li>`);
   if (topCo) bullets.push(`<li class="good">Most offers from: <b>${DATA.topCompaniesByBranch[b][0].name}</b> (${nOffers(DATA.topCompaniesByBranch[b][0].offers)}).</li>`);
-  if (topPay) bullets.push(`<li class="good">Highest average package from: <b>${DATA.topPayingByBranch[b][0].name}</b> at ₹${fmtPkg(DATA.topPayingByBranch[b][0].avg)} LPA${DATA.topPayingByBranch[b][0].offers===1?' (single offer)':''}.</li>`);
+  if (topPay) bullets.push(`<li class="good">Highest average package from: <b>${DATA.topPayingByBranch[b][0].name}</b> at ${fmtPkg(DATA.topPayingByBranch[b][0].avg)}${DATA.topPayingByBranch[b][0].offers===1?' (single offer)':''}.</li>`);
   if (c.cls==='discontinued') bullets.push(`<li class="bad">No offers since ${active[active.length-1]} — appears discontinued or paused.</li>`);
   if (c.cls==='new') bullets.push(`<li class="flag">First appeared in ${active[0]} — too new to judge a trend yet.</li>`);
   if (bt.gapYears.length) bullets.push(`<li class="bad">Offers before and after, but none in: <b>${bt.gapYears.join(', ')}</b> — worth checking whether recruiting paused or data is missing for those years.</li>`);
@@ -1709,7 +1853,7 @@ function renderAllBranch(b){
   if (c.cls==='new') actionItems.push({t:'Short-term', text:`${b} is new to the data (first appeared ${active[0]}) — prioritize building 2–3 repeat recruiter relationships before judging this branch's placement health.`});
   const topShareB = DATA.topCompaniesByBranch[b].length && bt.offers ? Math.round((DATA.topCompaniesByBranch[b][0].offers/bt.offers)*100) : 0;
   if (topShareB>=40) actionItems.push({t:'Long-term', text:`${DATA.topCompaniesByBranch[b][0].name} accounts for ${topShareB}% of ${b}'s placements — diversify recruiters for this branch to reduce dependence on one company.`});
-  if (bt.avg!==null && DATA.grandTotal.avg!==null && bt.avg < DATA.grandTotal.avg*0.85) actionItems.push({t:'Long-term', text:`${b}'s average package (₹${fmtPkg(bt.avg)} LPA) trails the institution-wide average (₹${fmtPkg(DATA.grandTotal.avg)} LPA) — work with faculty/industry liaisons on curriculum alignment or specialization tracks that attract higher-paying recruiters.`});
+  if (bt.avg!==null && DATA.grandTotal.avg!==null && bt.avg < DATA.grandTotal.avg*0.85) actionItems.push({t:'Long-term', text:`${b}'s average package (${fmtPkg(bt.avg)}) trails the institution-wide average (${fmtPkg(DATA.grandTotal.avg)}) — work with faculty/industry liaisons on curriculum alignment or specialization tracks that attract higher-paying recruiters.`});
   if (!actionItems.length) actionItems.push({t:'Short-term', text:`No red flags for ${b} — maintain the current recruiter relationships and revisit this view again after next cycle's data comes in.`});
 
   wrap.innerHTML = `
@@ -1744,8 +1888,8 @@ function renderYearBranch(y,b){
       const share = Math.round((topCo[0].offers/st.offers)*100);
       bullets.push(`<li class="${share>=50?'flag':''}">Top recruiter <b>${topCo[0].name}</b> accounted for ${share}% of this year's offers for ${b}.</li>`);
     }
-    if (topPay.length) bullets.push(`<li class="good">Highest package: <b>${topPay[0].name}</b> at ₹${fmtPkg(topPay[0].avg)} LPA${topPay[0].offers===1?' (single offer)':''}.</li>`);
-    if (st.max!==null && st.min!==null && st.max>0) bullets.push(`<li>Package spread: ₹${fmtPkg(st.min)}–₹${fmtPkg(st.max)} LPA (${st.max/st.min>=2?'wide range':'fairly consistent'}).</li>`);
+    if (topPay.length) bullets.push(`<li class="good">Highest package: <b>${topPay[0].name}</b> at ${fmtPkg(topPay[0].avg)}${topPay[0].offers===1?' (single offer)':''}.</li>`);
+    if (st.max!==null && st.min!==null && st.max>0) bullets.push(`<li>Package spread: ${fmtPkg(st.min)}–${fmtPkg(st.max)} (${st.max/st.min>=2?'wide range':'fairly consistent'}).</li>`);
   } else {
     bullets.push(`<li class="bad">No offers recorded for ${b} in ${y}.</li>`);
     if (prevY && prevSt.offers>0) bullets.push(`<li class="flag">Had ${nOffers(prevSt.offers)} in ${prevY} — recruiting appears to have paused.</li>`);

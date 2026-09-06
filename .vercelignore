@@ -1,0 +1,12 @@
+# Vercel deploys everything in the repo as a static file by default unless excluded here.
+# Without this file, the real student placement data and the test suite would be
+# publicly downloadable at the deployed URL.
+
+Task_A_Raw_Placement_Data_5_Years.xlsx
+Placement_Data_Clean*.xlsx
+Placement_Data_Pipeline.html
+test/
+files/
+files.zip
+CLAUDE.md
+.DS_Store

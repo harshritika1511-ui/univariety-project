@@ -1,0 +1,8 @@
+{
+  "name": "placement-data-pipeline",
+  "private": true,
+  "description": "Test suite for index.html (the tool itself has no dependencies and no build step — this is dev-only tooling).",
+  "scripts": {
+    "test": "node --test test/*.test.js"
+  }
+}
